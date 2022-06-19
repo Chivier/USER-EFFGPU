@@ -1,8 +1,10 @@
+// clang-format off
 #ifdef PAIR_CLASS
 
 PairStyle(eff/cut/gpu, PairEffCutGPU)
 
 #else
+// clang-format on
 
 #ifndef LMP_PAIR_EFF_CUT_GPU_H
 #define LMP_PAIR_EFF_CUT_GPU_H
@@ -12,7 +14,7 @@ PairStyle(eff/cut/gpu, PairEffCutGPU)
 namespace LAMMPS_NS {
 
 class PairEffCutGPU : public Pair {
- public:
+public:
   PairEffCutGPU(class LAMMPS *);
   virtual ~PairEffCutGPU();
   virtual void compute(int, int);
@@ -31,23 +33,24 @@ class PairEffCutGPU : public Pair {
   void min_x_set(int);
   double memory_usage();
 
- private:
+private:
   int limit_eradius_flag, pressure_with_evirials_flag;
   double cut_global;
   double **cut;
   int ecp_type[100];
-  double PAULI_CORE_A[100], PAULI_CORE_B[100], PAULI_CORE_C[100], PAULI_CORE_D[100], PAULI_CORE_E[100];
+  double PAULI_CORE_A[100], PAULI_CORE_B[100], PAULI_CORE_C[100],
+      PAULI_CORE_D[100], PAULI_CORE_E[100];
   double hhmss2e, h2e;
 
   int nmax;
-  double *min_eradius,*min_erforce;
+  double *min_eradius, *min_erforce;
 
   void allocate();
   void virial_eff_compute();
   void ev_tally_eff(int, int, int, int, double, double);
 };
 
-}
+} // namespace LAMMPS_NS
 
 #endif
 #endif

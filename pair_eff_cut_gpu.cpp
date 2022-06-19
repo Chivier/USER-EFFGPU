@@ -17,29 +17,28 @@
 
 #include "eff_gpu.h"
 
-#include <mpi.h>
+#include "atom.h"
+#include "comm.h"
+#include "domain.h"
+#include "error.h"
+#include "force.h"
+#include "memory.h"
+#include "min.h"
+#include "neigh_list.h"
+#include "neighbor.h"
+#include "pair_eff_cut_gpu.h"
+#include "update.h"
+#include "utils.h"
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include "pair_eff_cut_gpu.h"
-#include "atom.h"
-#include "update.h"
-#include "min.h"
-#include "domain.h"
-#include "comm.h"
-#include "force.h"
-#include "neighbor.h"
-#include "neigh_list.h"
-#include "memory.h"
-#include "error.h"
-#include "utils.h"
+#include <mpi.h>
 
 using namespace LAMMPS_NS;
 
 /* ---------------------------------------------------------------------- */
 
-PairEffCutGPU::PairEffCutGPU(LAMMPS *lmp) : Pair(lmp)
-{
+PairEffCutGPU::PairEffCutGPU(LAMMPS *lmp) : Pair(lmp) {
   single_enable = 0;
 
   nmax = 0;
@@ -51,9 +50,8 @@ PairEffCutGPU::PairEffCutGPU(LAMMPS *lmp) : Pair(lmp)
 
 /* ---------------------------------------------------------------------- */
 
-PairEffCutGPU::~PairEffCutGPU()
-{
-  delete [] pvector;
+PairEffCutGPU::~PairEffCutGPU() {
+  delete[] pvector;
   memory->destroy(min_eradius);
   memory->destroy(min_erforce);
 
@@ -66,24 +64,25 @@ PairEffCutGPU::~PairEffCutGPU()
 
 /* ---------------------------------------------------------------------- */
 
-void PairEffCutGPU::compute(int eflag, int vflag)
-{
-  int i,j,ii,jj,inum,jnum,itype,jtype;
-  double xtmp,ytmp,ztmp,delx,dely,delz,energy;
-  double eke,ecoul,epauli,errestrain,halfcoul,halfpauli;
-  double fpair,fx,fy,fz;
-  double e1rforce,e2rforce,e1rvirial,e2rvirial;
+void PairEffCutGPU::compute(int eflag, int vflag) {
+  int i, j, ii, jj, inum, jnum, itype, jtype;
+  double xtmp, ytmp, ztmp, delx, dely, delz, energy;
+  double eke, ecoul, epauli, errestrain, halfcoul, halfpauli;
+  double fpair, fx, fy, fz;
+  double e1rforce, e2rforce, e1rvirial, e2rvirial;
   double s_fpair, s_e1rforce, s_e2rforce;
   double ecp_epauli, ecp_fpair, ecp_e1rforce, ecp_e2rforce;
-  double rsq,rc;
-  int *ilist,*jlist,*numneigh,**firstneigh;
+  double rsq, rc;
+  int *ilist, *jlist, *numneigh, **firstneigh;
 
   energy = eke = epauli = ecp_epauli = ecoul = errestrain = 0.0;
   // pvector = [KE, Pauli, ecoul, radial_restraint]
-  for (i=0; i<4; i++) pvector[i] = 0.0;
+  for (i = 0; i < 4; i++)
+    pvector[i] = 0.0;
 
-  ev_init(eflag,vflag);
+  ev_init(eflag, vflag);
 
+  int natoms = atom->natoms;
   double **x = atom->x;
   double **f = atom->f;
   double *q = atom->q;
@@ -101,6 +100,16 @@ void PairEffCutGPU::compute(int eflag, int vflag)
   numneigh = list->numneigh;
   firstneigh = list->firstneigh;
 
+  struct EFF_GPU eff_gpu;
+  eff_gpu = cuda_AllocateStructure();
+  cuda_FetchData(eff_gpu, natoms, x, f, q, erforce, eradius, spin, type, nlocal,
+                 newton_pair, qqrd2e, inum, ilist, numneigh, firstneigh);
+  cudaDeviceSynchronize();
+
+  cuda_eff_test(eff_gpu);
+
+  // cuda_eff_compute(eff_gpu);
+
   // loop over neighbors of my atoms
   for (ii = 0; ii < inum; ii++) {
     i = ilist[ii];
@@ -113,25 +122,26 @@ void PairEffCutGPU::compute(int eflag, int vflag)
 
     // add electron wavefuntion kinetic energy (not pairwise)
 
-    if (abs(spin[i])==1 || spin[i]==2) {
+    if (abs(spin[i]) == 1 || spin[i] == 2) {
       // reset energy and force temp variables
       eke = epauli = ecoul = 0.0;
       fpair = e1rforce = e2rforce = 0.0;
       s_fpair = 0.0;
 
-      cuda_KinElec(eradius[i],&eke,&e1rforce);
+      cuda_KinElec(eradius[i], &eke, &e1rforce);
 
       // Fixed-core
       if (spin[i] == 2) {
         // KE(2s)+Coul(1s-1s)+Coul(2s-nuclei)+Pauli(2s)
         eke *= 2;
-        cuda_ElecNucElec(q[i],0.0,eradius[i],&ecoul,&fpair,&e1rforce);
-        cuda_ElecNucElec(q[i],0.0,eradius[i],&ecoul,&fpair,&e1rforce);
-        cuda_ElecElecElec(0.0,eradius[i],eradius[i],&ecoul,&fpair,&e1rforce,&e2rforce);
+        cuda_ElecNucElec(q[i], 0.0, eradius[i], &ecoul, &fpair, &e1rforce);
+        cuda_ElecNucElec(q[i], 0.0, eradius[i], &ecoul, &fpair, &e1rforce);
+        cuda_ElecElecElec(0.0, eradius[i], eradius[i], &ecoul, &fpair,
+                          &e1rforce, &e2rforce);
 
         // opposite spin electron interactions
-        cuda_PauliElecElec(0,0.0,eradius[i],eradius[i],
-            &epauli,&s_fpair,&e1rforce,&e2rforce);
+        cuda_PauliElecElec(0, 0.0, eradius[i], eradius[i], &epauli, &s_fpair,
+                           &e1rforce, &e2rforce);
 
         // fix core electron size, i.e. don't contribute to ervirial
         e2rforce = e1rforce = 0.0;
@@ -153,9 +163,9 @@ void PairEffCutGPU::compute(int eflag, int vflag)
 
       // Tally energy and compute radial atomic virial contribution
       if (evflag) {
-        ev_tally_eff(i,i,nlocal,newton_pair,energy,0.0);
+        ev_tally_eff(i, i, nlocal, newton_pair, energy, 0.0);
         if (pressure_with_evirials_flag) // iff flexible pressure flag on
-          ev_tally_eff(i,i,nlocal,newton_pair,0.0,e1rforce*eradius[i]);
+          ev_tally_eff(i, i, nlocal, newton_pair, 0.0, e1rforce * eradius[i]);
       }
       if (eflag_global) {
         pvector[0] += eke;
@@ -171,7 +181,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
       delx = xtmp - x[j][0];
       dely = ytmp - x[j][1];
       delz = ztmp - x[j][2];
-      rsq = delx*delx + dely*dely + delz*delz;
+      rsq = delx * delx + dely * dely + delz * delz;
       rc = sqrt(rsq);
 
       jtype = type[j];
@@ -189,63 +199,63 @@ void PairEffCutGPU::compute(int eflag, int vflag)
         // nucleus (i) - nucleus (j) Coul interaction
 
         if (spin[i] == 0 && spin[j] == 0) {
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
 
           cuda_ElecNucNuc(qxq, rc, &ecoul, &fpair);
         }
 
         // fixed-core (i) - nucleus (j) nuclear Coul interaction
         else if (spin[i] == 2 && spin[j] == 0) {
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
           e1rforce = 0.0;
 
           cuda_ElecNucNuc(qxq, rc, &ecoul, &fpair);
-          cuda_ElecNucElec(q[j],rc,eradius[i],&ecoul,&fpair,&e1rforce);
-          cuda_ElecNucElec(q[j],rc,eradius[i],&ecoul,&fpair,&e1rforce);
+          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
+          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
         }
 
         // nucleus (i) - fixed-core (j) nuclear Coul interaction
         else if (spin[i] == 0 && spin[j] == 2) {
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
           e1rforce = 0.0;
 
           cuda_ElecNucNuc(qxq, rc, &ecoul, &fpair);
-          cuda_ElecNucElec(q[i],rc,eradius[j],&ecoul,&fpair,&e1rforce);
-          cuda_ElecNucElec(q[i],rc,eradius[j],&ecoul,&fpair,&e1rforce);
+          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
+          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
         }
 
         // pseudo-core nucleus (i) - nucleus (j) interaction
         else if (spin[i] == 3 && spin[j] == 0) {
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
 
           cuda_ElecCoreNuc(qxq, rc, eradius[i], &ecoul, &fpair);
         }
 
         else if (spin[i] == 4 && spin[j] == 0) {
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
 
           cuda_ElecCoreNuc(qxq, rc, eradius[i], &ecoul, &fpair);
         }
 
         // nucleus (i) - pseudo-core nucleus (j) interaction
         else if (spin[i] == 0 && spin[j] == 3) {
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
 
           cuda_ElecCoreNuc(qxq, rc, eradius[j], &ecoul, &fpair);
         }
 
         else if (spin[i] == 0 && spin[j] == 4) {
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
 
           cuda_ElecCoreNuc(qxq, rc, eradius[j], &ecoul, &fpair);
         }
 
         // nucleus (i) - electron (j) Coul interaction
 
-        else if  (spin[i] == 0 && abs(spin[j]) == 1) {
+        else if (spin[i] == 0 && abs(spin[j]) == 1) {
           e1rforce = 0.0;
 
-          cuda_ElecNucElec(q[i],rc,eradius[j],&ecoul,&fpair,&e1rforce);
+          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
 
           e1rforce = spline * qqrd2e * e1rforce;
           erforce[j] += e1rforce;
@@ -253,7 +263,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           // Radial electron virial, iff flexible pressure flag set
           if (evflag && pressure_with_evirials_flag) {
             e1rvirial = eradius[j] * e1rforce;
-            ev_tally_eff(j,j,nlocal,newton_pair,0.0,e1rvirial);
+            ev_tally_eff(j, j, nlocal, newton_pair, 0.0, e1rvirial);
           }
         }
 
@@ -262,7 +272,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
         else if (abs(spin[i]) == 1 && spin[j] == 0) {
           e1rforce = 0.0;
 
-          cuda_ElecNucElec(q[j],rc,eradius[i],&ecoul,&fpair,&e1rforce);
+          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
 
           e1rforce = spline * qqrd2e * e1rforce;
           erforce[i] += e1rforce;
@@ -270,7 +280,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           // Radial electron virial, iff flexible pressure flag set
           if (evflag && pressure_with_evirials_flag) {
             e1rvirial = eradius[i] * e1rforce;
-            ev_tally_eff(i,i,nlocal,newton_pair,0.0,e1rvirial);
+            ev_tally_eff(i, i, nlocal, newton_pair, 0.0, e1rvirial);
           }
         }
 
@@ -280,10 +290,10 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           e1rforce = e2rforce = 0.0;
           s_e1rforce = s_e2rforce = 0.0;
 
-          cuda_ElecElecElec(rc,eradius[i],eradius[j],&ecoul,&fpair,
-                       &e1rforce,&e2rforce);
-          cuda_PauliElecElec(spin[i] == spin[j],rc,eradius[i],eradius[j],
-                       &epauli,&s_fpair,&s_e1rforce,&s_e2rforce);
+          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
+          cuda_PauliElecElec(spin[i] == spin[j], rc, eradius[i], eradius[j],
+                             &epauli, &s_fpair, &s_e1rforce, &s_e2rforce);
 
           // Apply conversion factor
           epauli *= hhmss2e;
@@ -298,7 +308,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           if (evflag && pressure_with_evirials_flag) {
             e1rvirial = eradius[i] * e1rforce;
             e2rvirial = eradius[j] * e2rforce;
-            ev_tally_eff(i,j,nlocal,newton_pair,0.0,e1rvirial+e2rvirial);
+            ev_tally_eff(i, j, nlocal, newton_pair, 0.0, e1rvirial + e2rvirial);
           }
         }
 
@@ -308,15 +318,15 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           e1rforce = e2rforce = 0.0;
           s_e1rforce = s_e2rforce = 0.0;
 
-          cuda_ElecNucElec(q[i],rc,eradius[j],&ecoul,&fpair,&e2rforce);
-          cuda_ElecElecElec(rc,eradius[i],eradius[j],&ecoul,&fpair,
-                         &e1rforce,&e2rforce);
-          cuda_ElecElecElec(rc,eradius[i],eradius[j],&ecoul,&fpair,
-                         &e1rforce,&e2rforce);
-          cuda_PauliElecElec(0,rc,eradius[i],eradius[j],&epauli,
-                       &s_fpair,&s_e1rforce,&s_e2rforce);
-          cuda_PauliElecElec(1,rc,eradius[i],eradius[j],&epauli,
-                       &s_fpair,&s_e1rforce,&s_e2rforce);
+          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e2rforce);
+          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
+          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
+          cuda_PauliElecElec(0, rc, eradius[i], eradius[j], &epauli, &s_fpair,
+                             &s_e1rforce, &s_e2rforce);
+          cuda_PauliElecElec(1, rc, eradius[i], eradius[j], &epauli, &s_fpair,
+                             &s_e1rforce, &s_e2rforce);
 
           // Apply conversion factor
           epauli *= hhmss2e;
@@ -329,7 +339,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           // Radial electron virial, iff flexible pressure flag set
           if (evflag && pressure_with_evirials_flag) {
             e2rvirial = eradius[j] * e2rforce;
-            ev_tally_eff(j,j,nlocal,newton_pair,0.0,e2rvirial);
+            ev_tally_eff(j, j, nlocal, newton_pair, 0.0, e2rvirial);
           }
         }
 
@@ -339,16 +349,16 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           e1rforce = e2rforce = 0.0;
           s_e1rforce = s_e2rforce = 0.0;
 
-          cuda_ElecNucElec(q[j],rc,eradius[i],&ecoul,&fpair,&e2rforce);
-          cuda_ElecElecElec(rc,eradius[j],eradius[i],&ecoul,&fpair,
-                         &e1rforce,&e2rforce);
-          cuda_ElecElecElec(rc,eradius[j],eradius[i],&ecoul,&fpair,
-                         &e1rforce,&e2rforce);
+          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e2rforce);
+          cuda_ElecElecElec(rc, eradius[j], eradius[i], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
+          cuda_ElecElecElec(rc, eradius[j], eradius[i], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
 
-          cuda_PauliElecElec(0,rc,eradius[j],eradius[i],&epauli,
-                       &s_fpair,&s_e1rforce,&s_e2rforce);
-          cuda_PauliElecElec(1,rc,eradius[j],eradius[i],&epauli,
-                       &s_fpair,&s_e1rforce,&s_e2rforce);
+          cuda_PauliElecElec(0, rc, eradius[j], eradius[i], &epauli, &s_fpair,
+                             &s_e1rforce, &s_e2rforce);
+          cuda_PauliElecElec(1, rc, eradius[j], eradius[i], &epauli, &s_fpair,
+                             &s_e1rforce, &s_e2rforce);
 
           // Apply conversion factor
           epauli *= hhmss2e;
@@ -361,7 +371,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           // add radial atomic virial, iff flexible pressure flag set
           if (evflag && pressure_with_evirials_flag) {
             e2rvirial = eradius[i] * e2rforce;
-            ev_tally_eff(i,i,nlocal,newton_pair,0.0,e2rvirial);
+            ev_tally_eff(i, i, nlocal, newton_pair, 0.0, e2rvirial);
           }
         }
 
@@ -370,26 +380,26 @@ void PairEffCutGPU::compute(int eflag, int vflag)
         else if (spin[i] == 2 && spin[j] == 2) {
           e1rforce = e2rforce = 0.0;
           s_e1rforce = s_e2rforce = 0.0;
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
 
           cuda_ElecNucNuc(qxq, rc, &ecoul, &fpair);
-          cuda_ElecNucElec(q[i],rc,eradius[j],&ecoul,&fpair,&e1rforce);
-          cuda_ElecNucElec(q[i],rc,eradius[j],&ecoul,&fpair,&e1rforce);
-          cuda_ElecNucElec(q[j],rc,eradius[i],&ecoul,&fpair,&e1rforce);
-          cuda_ElecNucElec(q[j],rc,eradius[i],&ecoul,&fpair,&e1rforce);
-          cuda_ElecElecElec(rc,eradius[i],eradius[j],&ecoul,&fpair,
-                         &e1rforce,&e2rforce);
-          cuda_ElecElecElec(rc,eradius[i],eradius[j],&ecoul,&fpair,
-                         &e1rforce,&e2rforce);
-          cuda_ElecElecElec(rc,eradius[i],eradius[j],&ecoul,&fpair,
-                         &e1rforce,&e2rforce);
-          cuda_ElecElecElec(rc,eradius[i],eradius[j],&ecoul,&fpair,
-                         &e1rforce,&e2rforce);
+          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
+          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
+          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
+          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
+          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
+          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
+          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
+          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
+                            &e1rforce, &e2rforce);
 
-          cuda_PauliElecElec(0,rc,eradius[i],eradius[j],&epauli,
-                       &s_fpair,&s_e1rforce,&s_e2rforce);
-          cuda_PauliElecElec(1,rc,eradius[i],eradius[j],&epauli,
-                       &s_fpair,&s_e1rforce,&s_e2rforce);
+          cuda_PauliElecElec(0, rc, eradius[i], eradius[j], &epauli, &s_fpair,
+                             &s_e1rforce, &s_e2rforce);
+          cuda_PauliElecElec(1, rc, eradius[i], eradius[j], &epauli, &s_fpair,
+                             &s_e1rforce, &s_e2rforce);
           epauli *= 2;
           s_fpair *= 2;
 
@@ -403,47 +413,57 @@ void PairEffCutGPU::compute(int eflag, int vflag)
         else if (spin[i] == 3 && (abs(spin[j]) == 1 || spin[j] == 2)) {
           e2rforce = ecp_e2rforce = 0.0;
 
-          if (((PAULI_CORE_D[ecp_type[itype]]) == 0.0) && ((PAULI_CORE_E[ecp_type[itype]]) == 0.0)) {
+          if (((PAULI_CORE_D[ecp_type[itype]]) == 0.0) &&
+              ((PAULI_CORE_E[ecp_type[itype]]) == 0.0)) {
             if (abs(spin[j]) == 1) {
-              cuda_ElecCoreElec(q[i],rc,eradius[i],eradius[j],&ecoul,
-                          &fpair,&e2rforce);
-              cuda_PauliCoreElec(rc,eradius[j],&ecp_epauli,&ecp_fpair,
-                          &ecp_e2rforce,PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
-                          PAULI_CORE_C[ecp_type[itype]]);
+              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
+                                &fpair, &e2rforce);
+              cuda_PauliCoreElec(rc, eradius[j], &ecp_epauli, &ecp_fpair,
+                                 &ecp_e2rforce, PAULI_CORE_A[ecp_type[itype]],
+                                 PAULI_CORE_B[ecp_type[itype]],
+                                 PAULI_CORE_C[ecp_type[itype]]);
             } else { // add second s electron contribution from fixed-core
-              double qxq = q[i]*q[j];
+              double qxq = q[i] * q[j];
               cuda_ElecCoreNuc(qxq, rc, eradius[j], &ecoul, &fpair);
-              cuda_ElecCoreElec(q[i],rc,eradius[i],eradius[j],&ecoul,
-                          &fpair,&e2rforce);
-              cuda_ElecCoreElec(q[i],rc,eradius[i],eradius[j],&ecoul,
-                          &fpair,&e2rforce);
-              cuda_PauliCoreElec(rc,eradius[j],&ecp_epauli,&ecp_fpair,
-                          &ecp_e2rforce,PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
-                          PAULI_CORE_C[ecp_type[itype]]);
-              cuda_PauliCoreElec(rc,eradius[j],&ecp_epauli,&ecp_fpair,
-                          &ecp_e2rforce,PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
-                          PAULI_CORE_C[ecp_type[itype]]);
+              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
+                                &fpair, &e2rforce);
+              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
+                                &fpair, &e2rforce);
+              cuda_PauliCoreElec(rc, eradius[j], &ecp_epauli, &ecp_fpair,
+                                 &ecp_e2rforce, PAULI_CORE_A[ecp_type[itype]],
+                                 PAULI_CORE_B[ecp_type[itype]],
+                                 PAULI_CORE_C[ecp_type[itype]]);
+              cuda_PauliCoreElec(rc, eradius[j], &ecp_epauli, &ecp_fpair,
+                                 &ecp_e2rforce, PAULI_CORE_A[ecp_type[itype]],
+                                 PAULI_CORE_B[ecp_type[itype]],
+                                 PAULI_CORE_C[ecp_type[itype]]);
             }
           } else {
             if (abs(spin[j]) == 1) {
-              cuda_ElecCoreElec(q[i],rc,eradius[i],eradius[j],&ecoul,
-                          &fpair,&e2rforce);
-              cuda_PauliCorePElec(rc,eradius[j],&ecp_epauli,&ecp_fpair,
-                          &ecp_e2rforce,PAULI_CORE_A[ecp_type[itype]],PAULI_CORE_B[ecp_type[itype]],
-                          PAULI_CORE_C[ecp_type[itype]],PAULI_CORE_D[ecp_type[itype]],PAULI_CORE_E[ecp_type[itype]]);
+              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
+                                &fpair, &e2rforce);
+              cuda_PauliCorePElec(
+                  rc, eradius[j], &ecp_epauli, &ecp_fpair, &ecp_e2rforce,
+                  PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
+                  PAULI_CORE_C[ecp_type[itype]], PAULI_CORE_D[ecp_type[itype]],
+                  PAULI_CORE_E[ecp_type[itype]]);
             } else { // add second s electron contribution from fixed-core
-              double qxq = q[i]*q[j];
+              double qxq = q[i] * q[j];
               cuda_ElecCoreNuc(qxq, rc, eradius[j], &ecoul, &fpair);
-              cuda_ElecCoreElec(q[i],rc,eradius[i],eradius[j],&ecoul,
-                          &fpair,&e2rforce);
-              cuda_ElecCoreElec(q[i],rc,eradius[i],eradius[j],&ecoul,
-                          &fpair,&e2rforce);
-              cuda_PauliCorePElec(rc,eradius[j],&ecp_epauli,&ecp_fpair,
-                          &ecp_e2rforce,PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
-                          PAULI_CORE_C[ecp_type[itype]],PAULI_CORE_D[ecp_type[itype]],PAULI_CORE_E[ecp_type[itype]]);
-              cuda_PauliCorePElec(rc,eradius[j],&ecp_epauli,&ecp_fpair,
-                          &ecp_e2rforce,PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
-                          PAULI_CORE_C[ecp_type[itype]],PAULI_CORE_D[ecp_type[itype]],PAULI_CORE_E[ecp_type[itype]]);
+              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
+                                &fpair, &e2rforce);
+              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
+                                &fpair, &e2rforce);
+              cuda_PauliCorePElec(
+                  rc, eradius[j], &ecp_epauli, &ecp_fpair, &ecp_e2rforce,
+                  PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
+                  PAULI_CORE_C[ecp_type[itype]], PAULI_CORE_D[ecp_type[itype]],
+                  PAULI_CORE_E[ecp_type[itype]]);
+              cuda_PauliCorePElec(
+                  rc, eradius[j], &ecp_epauli, &ecp_fpair, &ecp_e2rforce,
+                  PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
+                  PAULI_CORE_C[ecp_type[itype]], PAULI_CORE_D[ecp_type[itype]],
+                  PAULI_CORE_E[ecp_type[itype]]);
             }
           }
 
@@ -458,7 +478,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           // add radial atomic virial, iff flexible pressure flag set
           if (evflag && pressure_with_evirials_flag) {
             e2rvirial = eradius[j] * e2rforce;
-            ev_tally_eff(j,j,nlocal,newton_pair,0.0,e2rvirial);
+            ev_tally_eff(j, j, nlocal, newton_pair, 0.0, e2rvirial);
           }
         }
 
@@ -467,47 +487,57 @@ void PairEffCutGPU::compute(int eflag, int vflag)
         else if ((abs(spin[i]) == 1 || spin[i] == 2) && spin[j] == 3) {
           e1rforce = ecp_e1rforce = 0.0;
 
-          if (((PAULI_CORE_D[ecp_type[jtype]]) == 0.0) && ((PAULI_CORE_E[ecp_type[jtype]]) == 0.0)) {
+          if (((PAULI_CORE_D[ecp_type[jtype]]) == 0.0) &&
+              ((PAULI_CORE_E[ecp_type[jtype]]) == 0.0)) {
             if (abs(spin[i]) == 1) {
-              cuda_ElecCoreElec(q[j],rc,eradius[j],eradius[i],&ecoul,
-                          &fpair,&e1rforce);
-              cuda_PauliCoreElec(rc,eradius[i],&ecp_epauli,&ecp_fpair,
-                          &ecp_e1rforce,PAULI_CORE_A[ecp_type[jtype]],PAULI_CORE_B[ecp_type[jtype]],
-                          PAULI_CORE_C[ecp_type[jtype]]);
+              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
+                                &fpair, &e1rforce);
+              cuda_PauliCoreElec(rc, eradius[i], &ecp_epauli, &ecp_fpair,
+                                 &ecp_e1rforce, PAULI_CORE_A[ecp_type[jtype]],
+                                 PAULI_CORE_B[ecp_type[jtype]],
+                                 PAULI_CORE_C[ecp_type[jtype]]);
             } else {
-              double qxq = q[i]*q[j];
-              cuda_ElecCoreNuc(qxq,rc,eradius[i],&ecoul,&fpair);
-              cuda_ElecCoreElec(q[j],rc,eradius[j],eradius[i],&ecoul,
-                          &fpair,&e1rforce);
-              cuda_ElecCoreElec(q[j],rc,eradius[j],eradius[i],&ecoul,
-                          &fpair,&e1rforce);
-              cuda_PauliCoreElec(rc,eradius[i],&ecp_epauli,&ecp_fpair,
-                          &ecp_e1rforce,PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
-                          PAULI_CORE_C[ecp_type[jtype]]);
-              cuda_PauliCoreElec(rc,eradius[i],&ecp_epauli,&ecp_fpair,
-                          &ecp_e1rforce,PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
-                          PAULI_CORE_C[ecp_type[jtype]]);
+              double qxq = q[i] * q[j];
+              cuda_ElecCoreNuc(qxq, rc, eradius[i], &ecoul, &fpair);
+              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
+                                &fpair, &e1rforce);
+              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
+                                &fpair, &e1rforce);
+              cuda_PauliCoreElec(rc, eradius[i], &ecp_epauli, &ecp_fpair,
+                                 &ecp_e1rforce, PAULI_CORE_A[ecp_type[jtype]],
+                                 PAULI_CORE_B[ecp_type[jtype]],
+                                 PAULI_CORE_C[ecp_type[jtype]]);
+              cuda_PauliCoreElec(rc, eradius[i], &ecp_epauli, &ecp_fpair,
+                                 &ecp_e1rforce, PAULI_CORE_A[ecp_type[jtype]],
+                                 PAULI_CORE_B[ecp_type[jtype]],
+                                 PAULI_CORE_C[ecp_type[jtype]]);
             }
           } else {
             if (abs(spin[i]) == 1) {
-              cuda_ElecCoreElec(q[j],rc,eradius[j],eradius[i],&ecoul,
-                          &fpair,&e1rforce);
-              cuda_PauliCorePElec(rc,eradius[i],&ecp_epauli,&ecp_fpair,
-                          &ecp_e1rforce,PAULI_CORE_A[ecp_type[jtype]],PAULI_CORE_B[ecp_type[jtype]],
-                          PAULI_CORE_C[ecp_type[jtype]],PAULI_CORE_D[ecp_type[jtype]],PAULI_CORE_E[ecp_type[jtype]]);
+              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
+                                &fpair, &e1rforce);
+              cuda_PauliCorePElec(
+                  rc, eradius[i], &ecp_epauli, &ecp_fpair, &ecp_e1rforce,
+                  PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
+                  PAULI_CORE_C[ecp_type[jtype]], PAULI_CORE_D[ecp_type[jtype]],
+                  PAULI_CORE_E[ecp_type[jtype]]);
             } else {
-              double qxq = q[i]*q[j];
-              cuda_ElecCoreNuc(qxq,rc,eradius[i],&ecoul,&fpair);
-              cuda_ElecCoreElec(q[j],rc,eradius[j],eradius[i],&ecoul,
-                          &fpair,&e1rforce);
-              cuda_ElecCoreElec(q[j],rc,eradius[j],eradius[i],&ecoul,
-                          &fpair,&e1rforce);
-              cuda_PauliCorePElec(rc,eradius[i],&ecp_epauli,&ecp_fpair,
-                          &ecp_e1rforce,PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
-                          PAULI_CORE_C[ecp_type[jtype]],PAULI_CORE_D[ecp_type[jtype]],PAULI_CORE_E[ecp_type[jtype]]);
-              cuda_PauliCorePElec(rc,eradius[i],&ecp_epauli,&ecp_fpair,
-                          &ecp_e1rforce,PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
-                          PAULI_CORE_C[ecp_type[jtype]],PAULI_CORE_D[ecp_type[jtype]],PAULI_CORE_E[ecp_type[jtype]]);
+              double qxq = q[i] * q[j];
+              cuda_ElecCoreNuc(qxq, rc, eradius[i], &ecoul, &fpair);
+              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
+                                &fpair, &e1rforce);
+              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
+                                &fpair, &e1rforce);
+              cuda_PauliCorePElec(
+                  rc, eradius[i], &ecp_epauli, &ecp_fpair, &ecp_e1rforce,
+                  PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
+                  PAULI_CORE_C[ecp_type[jtype]], PAULI_CORE_D[ecp_type[jtype]],
+                  PAULI_CORE_E[ecp_type[jtype]]);
+              cuda_PauliCorePElec(
+                  rc, eradius[i], &ecp_epauli, &ecp_fpair, &ecp_e1rforce,
+                  PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
+                  PAULI_CORE_C[ecp_type[jtype]], PAULI_CORE_D[ecp_type[jtype]],
+                  PAULI_CORE_E[ecp_type[jtype]]);
             }
           }
 
@@ -522,16 +552,16 @@ void PairEffCutGPU::compute(int eflag, int vflag)
           // add radial atomic virial, iff flexible pressure flag set
           if (evflag && pressure_with_evirials_flag) {
             e1rvirial = eradius[i] * e1rforce;
-            ev_tally_eff(i,i,nlocal,newton_pair,0.0,e1rvirial);
+            ev_tally_eff(i, i, nlocal, newton_pair, 0.0, e1rvirial);
           }
         }
 
         // pseudo-core (i) - pseudo-core (j) interactions
 
         else if (spin[i] == 3 && spin[j] == 3) {
-          double qxq = q[i]*q[j];
+          double qxq = q[i] * q[j];
 
-          cuda_ElecCoreCore(qxq,rc,eradius[i],eradius[j],&ecoul,&fpair);
+          cuda_ElecCoreCore(qxq, rc, eradius[i], eradius[j], &ecoul, &fpair);
         }
 
         // Apply Coulomb conversion factor for all cases
@@ -548,7 +578,7 @@ void PairEffCutGPU::compute(int eflag, int vflag)
         energy = spline * energy;
 
         // Tally cartesian forces
-        cuda_SmallRForce(delx,dely,delz,rc,fpair,&fx,&fy,&fz);
+        cuda_SmallRForce(delx, dely, delz, rc, fpair, &fx, &fy, &fz);
         f[i][0] += fx;
         f[i][1] += fy;
         f[i][2] += fz;
@@ -559,14 +589,14 @@ void PairEffCutGPU::compute(int eflag, int vflag)
         }
 
         // Tally energy (in ecoul) and compute normal pressure virials
-        if (evflag) ev_tally_xyz(i,j,nlocal,newton_pair,0.0,
-                             energy,fx,fy,fz,delx,dely,delz);
+        if (evflag)
+          ev_tally_xyz(i, j, nlocal, newton_pair, 0.0, energy, fx, fy, fz, delx,
+                       dely, delz);
         if (eflag_global) {
           if (newton_pair) {
             pvector[1] += spline * epauli;
             pvector[2] += spline * ecoul;
-          }
-          else {
+          } else {
             halfpauli = 0.5 * spline * epauli;
             halfcoul = 0.5 * spline * ecoul;
             if (i < nlocal) {
@@ -579,53 +609,59 @@ void PairEffCutGPU::compute(int eflag, int vflag)
             }
           }
         }
-
       }
     }
 
     // limit electron stifness (size) for periodic systems, to max=half-box-size
 
     if (abs(spin[i]) == 1 && limit_eradius_flag) {
-      double half_box_length=0, dr, kfactor=hhmss2e*1.0;
+      double half_box_length = 0, dr, kfactor = hhmss2e * 1.0;
       e1rforce = errestrain = 0.0;
 
       if (domain->xperiodic == 1 || domain->yperiodic == 1 ||
           domain->zperiodic == 1) {
-        delx = domain->boxhi[0]-domain->boxlo[0];
-        dely = domain->boxhi[1]-domain->boxlo[1];
-        delz = domain->boxhi[2]-domain->boxlo[2];
+        delx = domain->boxhi[0] - domain->boxlo[0];
+        dely = domain->boxhi[1] - domain->boxlo[1];
+        delz = domain->boxhi[2] - domain->boxlo[2];
         half_box_length = 0.5 * MIN(delx, MIN(dely, delz));
         if (eradius[i] > half_box_length) {
-          dr = eradius[i]-half_box_length;
-          errestrain=0.5*kfactor*dr*dr;
-          e1rforce=-kfactor*dr;
-          if (eflag_global) pvector[3] += errestrain;
+          dr = eradius[i] - half_box_length;
+          errestrain = 0.5 * kfactor * dr * dr;
+          e1rforce = -kfactor * dr;
+          if (eflag_global)
+            pvector[3] += errestrain;
 
           erforce[i] += e1rforce;
 
           // Tally radial restrain energy and add radial restrain virial
           if (evflag) {
-            ev_tally_eff(i,i,nlocal,newton_pair,errestrain,0.0);
-            if (pressure_with_evirials_flag)  // flexible electron pressure
-              ev_tally_eff(i,i,nlocal,newton_pair,0.0,eradius[i]*e1rforce);
+            ev_tally_eff(i, i, nlocal, newton_pair, errestrain, 0.0);
+            if (pressure_with_evirials_flag) // flexible electron pressure
+              ev_tally_eff(i, i, nlocal, newton_pair, 0.0,
+                           eradius[i] * e1rforce);
           }
         }
       }
     }
-
   }
   if (vflag_fdotr) {
     virial_fdotr_compute();
-    if (pressure_with_evirials_flag) virial_eff_compute();
+    if (pressure_with_evirials_flag)
+      virial_eff_compute();
   }
+
+  cuda_FetchBackData(eff_gpu, natoms, x, f, q, erforce, eradius, spin, type,
+                     nlocal, newton_pair, qqrd2e, inum, ilist, numneigh,
+                     firstneigh);
+  cudaDeviceSynchronize();
+  cuda_DeallocateStructure(eff_gpu);
 }
 
 /* ----------------------------------------------------------------------
    eff-specific contribution to global virial
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::virial_eff_compute()
-{
+void PairEffCutGPU::virial_eff_compute() {
   double *eradius = atom->eradius;
   double *erforce = atom->erforce;
   double e_virial;
@@ -637,21 +673,21 @@ void PairEffCutGPU::virial_eff_compute()
     int nall = atom->nlocal + atom->nghost;
     for (int i = 0; i < nall; i++) {
       if (spin[i]) {
-        e_virial = erforce[i]*eradius[i]/3;
+        e_virial = erforce[i] * eradius[i] / 3;
         virial[0] += e_virial;
         virial[1] += e_virial;
         virial[2] += e_virial;
       }
     }
 
-  // neighbor includegroup flag is set
-  // sum over force on initial nfirst particles and ghosts
+    // neighbor includegroup flag is set
+    // sum over force on initial nfirst particles and ghosts
 
   } else {
     int nall = atom->nfirst;
     for (int i = 0; i < nall; i++) {
       if (spin[i]) {
-        e_virial = erforce[i]*eradius[i]/3;
+        e_virial = erforce[i] * eradius[i] / 3;
         virial[0] += e_virial;
         virial[1] += e_virial;
         virial[2] += e_virial;
@@ -661,7 +697,7 @@ void PairEffCutGPU::virial_eff_compute()
     nall = atom->nlocal + atom->nghost;
     for (int i = atom->nlocal; i < nall; i++) {
       if (spin[i]) {
-        e_virial = erforce[i]*eradius[i]/3;
+        e_virial = erforce[i] * eradius[i] / 3;
         virial[0] += e_virial;
         virial[1] += e_virial;
         virial[2] += e_virial;
@@ -676,11 +712,10 @@ void PairEffCutGPU::virial_eff_compute()
 ------------------------------------------------------------------------- */
 
 void PairEffCutGPU::ev_tally_eff(int i, int j, int nlocal, int newton_pair,
-                              double energy, double e_virial)
-{
+                                 double energy, double e_virial) {
   double energyhalf;
-  double partial_evirial = e_virial/3.0;
-  double half_partial_evirial = partial_evirial/2;
+  double partial_evirial = e_virial / 3.0;
+  double half_partial_evirial = partial_evirial / 2;
 
   int *spin = atom->spin;
 
@@ -689,7 +724,7 @@ void PairEffCutGPU::ev_tally_eff(int i, int j, int nlocal, int newton_pair,
       if (newton_pair)
         eng_coul += energy;
       else {
-        energyhalf = 0.5*energy;
+        energyhalf = 0.5 * energy;
         if (i < nlocal)
           eng_coul += energyhalf;
         if (j < nlocal)
@@ -697,8 +732,10 @@ void PairEffCutGPU::ev_tally_eff(int i, int j, int nlocal, int newton_pair,
       }
     }
     if (eflag_atom) {
-      if (newton_pair || i < nlocal) eatom[i] += 0.5 * energy;
-      if (newton_pair || j < nlocal) eatom[j] += 0.5 * energy;
+      if (newton_pair || i < nlocal)
+        eatom[i] += 0.5 * energy;
+      if (newton_pair || j < nlocal)
+        eatom[j] += 0.5 * energy;
     }
   }
 
@@ -738,28 +775,26 @@ void PairEffCutGPU::ev_tally_eff(int i, int j, int nlocal, int newton_pair,
    allocate all arrays
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::allocate()
-{
+void PairEffCutGPU::allocate() {
   allocated = 1;
   int n = atom->ntypes;
 
-  memory->create(setflag,n+1,n+1,"pair:setflag");
+  memory->create(setflag, n + 1, n + 1, "pair:setflag");
   for (int i = 1; i <= n; i++)
     for (int j = i; j <= n; j++)
       setflag[i][j] = 0;
 
-  memory->create(cutsq,n+1,n+1,"pair:cutsq");
-  memory->create(cut,n+1,n+1,"pair:cut");
+  memory->create(cutsq, n + 1, n + 1, "pair:cutsq");
+  memory->create(cut, n + 1, n + 1, "pair:cut");
 }
 
 /* ---------------------------------------------------------------------
    global settings
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::settings(int narg, char **arg)
-{
+void PairEffCutGPU::settings(int narg, char **arg) {
   if (narg < 1)
-    error->all(FLERR,"Illegal pair_style command");
+    error->all(FLERR, "Illegal pair_style command");
 
   // Defaults ECP parameters for C (radius=0.154)
   PAULI_CORE_A[6] = 22.721015;
@@ -796,7 +831,7 @@ void PairEffCutGPU::settings(int narg, char **arg)
   PAULI_CORE_D[14] = 0.0;
   PAULI_CORE_E[14] = 0.0;
 
-  cut_global = force->numeric(FLERR,arg[0]);
+  cut_global = force->numeric(FLERR, arg[0]);
   limit_eradius_flag = 0;
   pressure_with_evirials_flag = 0;
 
@@ -805,24 +840,30 @@ void PairEffCutGPU::settings(int narg, char **arg)
   int ecp_found = 0;
 
   while (iarg < narg) {
-    if (strcmp(arg[iarg],"limit/eradius") == 0) {
+    if (strcmp(arg[iarg], "limit/eradius") == 0) {
       limit_eradius_flag = 1;
       iarg += 1;
-    }
-    else if (strcmp(arg[iarg],"pressure/evirials") == 0) {
+    } else if (strcmp(arg[iarg], "pressure/evirials") == 0) {
       pressure_with_evirials_flag = 1;
       iarg += 1;
-    }
-    else if (strcmp(arg[iarg],"ecp") == 0) {
+    } else if (strcmp(arg[iarg], "ecp") == 0) {
       iarg += 1;
       while (iarg < narg) {
-        atype = force->inumeric(FLERR,arg[iarg]);
-        if (strcmp(arg[iarg+1],"C") == 0) ecp_type[atype] = 6;
-        else if (strcmp(arg[iarg+1],"N") == 0) ecp_type[atype] = 7;
-        else if (strcmp(arg[iarg+1],"O") == 0) ecp_type[atype] = 8;
-        else if (strcmp(arg[iarg+1],"Al") == 0) ecp_type[atype] = 13;
-        else if (strcmp(arg[iarg+1],"Si") == 0) ecp_type[atype] = 14;
-        else error->all(FLERR, "Note: there are no default parameters for this atom ECP\n");
+        atype = force->inumeric(FLERR, arg[iarg]);
+        if (strcmp(arg[iarg + 1], "C") == 0)
+          ecp_type[atype] = 6;
+        else if (strcmp(arg[iarg + 1], "N") == 0)
+          ecp_type[atype] = 7;
+        else if (strcmp(arg[iarg + 1], "O") == 0)
+          ecp_type[atype] = 8;
+        else if (strcmp(arg[iarg + 1], "Al") == 0)
+          ecp_type[atype] = 13;
+        else if (strcmp(arg[iarg + 1], "Si") == 0)
+          ecp_type[atype] = 14;
+        else
+          error->all(
+              FLERR,
+              "Note: there are no default parameters for this atom ECP\n");
         iarg += 2;
         ecp_found = 1;
       }
@@ -830,24 +871,26 @@ void PairEffCutGPU::settings(int narg, char **arg)
   }
 
   if (!ecp_found && atom->ecp_flag)
-    error->all(FLERR,"Need to specify ECP type on pair_style command");
+    error->all(FLERR, "Need to specify ECP type on pair_style command");
 
   // Need to introduce 2 new constants w/out changing update.cpp
-  if (force->qqr2e==332.06371) {        // i.e. Real units chosen
-    h2e = 627.509;                      // hartree->kcal/mol
-    hhmss2e = 175.72044219620075;       // hartree->kcal/mol * (Bohr->Angstrom)^2
-  } else if (force->qqr2e==1.0) {        // electron units
+  if (force->qqr2e == 332.06371) {  // i.e. Real units chosen
+    h2e = 627.509;                  // hartree->kcal/mol
+    hhmss2e = 175.72044219620075;   // hartree->kcal/mol * (Bohr->Angstrom)^2
+  } else if (force->qqr2e == 1.0) { // electron units
     h2e = 1.0;
     hhmss2e = 1.0;
-  } else error->all(FLERR,"Check your units");
+  } else
+    error->all(FLERR, "Check your units");
 
   // reset cutoffs that have been explicitly set
 
   if (allocated) {
-    int i,j;
+    int i, j;
     for (i = 1; i <= atom->ntypes; i++)
       for (j = i; j <= atom->ntypes; j++)
-        if (setflag[i][j]) cut[i][j] = cut_global;
+        if (setflag[i][j])
+          cut[i][j] = cut_global;
   }
 }
 
@@ -855,85 +898,86 @@ void PairEffCutGPU::settings(int narg, char **arg)
    init specific to this pair style
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::init_style()
-{
+void PairEffCutGPU::init_style() {
   // error and warning checks
 
-  if (!atom->q_flag || !atom->spin_flag ||
-      !atom->eradius_flag || !atom->erforce_flag)
-    error->all(FLERR,"Pair eff/cut requires atom attributes "
-               "q, spin, eradius, erforce");
+  if (!atom->q_flag || !atom->spin_flag || !atom->eradius_flag ||
+      !atom->erforce_flag)
+    error->all(FLERR, "Pair eff/cut requires atom attributes "
+                      "q, spin, eradius, erforce");
 
   // add hook to minimizer for eradius and erforce
 
   if (update->whichflag == 2)
-    update->minimize->request(this,1,0.01);
+    update->minimize->request(this, 1, 0.01);
 
   // make sure to use the appropriate timestep when using real units
 
   if (update->whichflag == 1) {
     if (force->qqr2e == 332.06371 && update->dt == 1.0)
-      error->all(FLERR,"You must lower the default real units timestep for pEFF ");
+      error->all(FLERR,
+                 "You must lower the default real units timestep for pEFF ");
   }
 
   // need a half neigh list and optionally a granular history neigh list
 
-  neighbor->request(this,instance_me);
+  neighbor->request(this, instance_me);
 }
 
 /* ----------------------------------------------------------------------
    set coeffs for one or more type electron pairs (ECP-only)
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::coeff(int narg, char **arg)
-{
-  if (!allocated) allocate();
+void PairEffCutGPU::coeff(int narg, char **arg) {
+  if (!allocated)
+    allocate();
 
-  if ((strcmp(arg[0],"*") == 0) || (strcmp(arg[1],"*") == 0)) {
-    int ilo,ihi,jlo,jhi;
-    force->bounds(FLERR,arg[0],atom->ntypes,ilo,ihi);
-    force->bounds(FLERR,arg[1],atom->ntypes,jlo,jhi);
+  if ((strcmp(arg[0], "*") == 0) || (strcmp(arg[1], "*") == 0)) {
+    int ilo, ihi, jlo, jhi;
+    force->bounds(FLERR, arg[0], atom->ntypes, ilo, ihi);
+    force->bounds(FLERR, arg[1], atom->ntypes, jlo, jhi);
 
     double cut_one = cut_global;
-    if (narg == 3) cut_one = force->numeric(FLERR,arg[2]);
+    if (narg == 3)
+      cut_one = force->numeric(FLERR, arg[2]);
 
     int count = 0;
     for (int i = ilo; i <= ihi; i++) {
-      for (int j = MAX(jlo,i); j <= jhi; j++) {
+      for (int j = MAX(jlo, i); j <= jhi; j++) {
         cut[i][j] = cut_one;
         setflag[i][j] = 1;
         count++;
       }
     }
-    if (count == 0) error->all(FLERR,"Incorrect args for pair coefficients");
+    if (count == 0)
+      error->all(FLERR, "Incorrect args for pair coefficients");
   } else {
     int ecp;
-    ecp = force->inumeric(FLERR,arg[0]);
-    if (strcmp(arg[1],"s") ==0) {
-      PAULI_CORE_A[ecp_type[ecp]] = force->numeric(FLERR,arg[2]);
-      PAULI_CORE_B[ecp_type[ecp]] = force->numeric(FLERR,arg[3]);
-      PAULI_CORE_C[ecp_type[ecp]] = force->numeric(FLERR,arg[4]);
+    ecp = force->inumeric(FLERR, arg[0]);
+    if (strcmp(arg[1], "s") == 0) {
+      PAULI_CORE_A[ecp_type[ecp]] = force->numeric(FLERR, arg[2]);
+      PAULI_CORE_B[ecp_type[ecp]] = force->numeric(FLERR, arg[3]);
+      PAULI_CORE_C[ecp_type[ecp]] = force->numeric(FLERR, arg[4]);
       PAULI_CORE_D[ecp_type[ecp]] = 0.0;
       PAULI_CORE_E[ecp_type[ecp]] = 0.0;
-    } else if (strcmp(arg[1],"p") ==0) {
-      PAULI_CORE_A[ecp_type[ecp]] = force->numeric(FLERR,arg[2]);
-      PAULI_CORE_B[ecp_type[ecp]] = force->numeric(FLERR,arg[3]);
-      PAULI_CORE_C[ecp_type[ecp]] = force->numeric(FLERR,arg[4]);
-      PAULI_CORE_D[ecp_type[ecp]] = force->numeric(FLERR,arg[5]);
-      PAULI_CORE_E[ecp_type[ecp]] = force->numeric(FLERR,arg[6]);
-    } else error->all(FLERR,"Illegal pair_coeff command");
+    } else if (strcmp(arg[1], "p") == 0) {
+      PAULI_CORE_A[ecp_type[ecp]] = force->numeric(FLERR, arg[2]);
+      PAULI_CORE_B[ecp_type[ecp]] = force->numeric(FLERR, arg[3]);
+      PAULI_CORE_C[ecp_type[ecp]] = force->numeric(FLERR, arg[4]);
+      PAULI_CORE_D[ecp_type[ecp]] = force->numeric(FLERR, arg[5]);
+      PAULI_CORE_E[ecp_type[ecp]] = force->numeric(FLERR, arg[6]);
+    } else
+      error->all(FLERR, "Illegal pair_coeff command");
   }
 }
-
 
 /* ----------------------------------------------------------------------
    init for one type pair i,j and corresponding j,i
 ------------------------------------------------------------------------- */
 
-double PairEffCutGPU::init_one(int i, int j)
-{
+double PairEffCutGPU::init_one(int i, int j) {
   if (setflag[i][j] == 0)
-    cut[i][j] = mix_distance(cut[i][i],cut[j][j]);
+    cut[i][j] = mix_distance(cut[i][i], cut[j][j]);
 
   return cut[i][j];
 }
@@ -942,15 +986,15 @@ double PairEffCutGPU::init_one(int i, int j)
    proc 0 writes to restart file
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::write_restart(FILE *fp)
-{
+void PairEffCutGPU::write_restart(FILE *fp) {
   write_restart_settings(fp);
 
-  int i,j;
+  int i, j;
   for (i = 1; i <= atom->ntypes; i++)
     for (j = i; j <= atom->ntypes; j++) {
-      fwrite(&setflag[i][j],sizeof(int),1,fp);
-      if (setflag[i][j]) fwrite(&cut[i][j],sizeof(double),1,fp);
+      fwrite(&setflag[i][j], sizeof(int), 1, fp);
+      if (setflag[i][j])
+        fwrite(&cut[i][j], sizeof(double), 1, fp);
     }
 }
 
@@ -958,20 +1002,21 @@ void PairEffCutGPU::write_restart(FILE *fp)
    proc 0 reads from restart file, bcasts
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::read_restart(FILE *fp)
-{
+void PairEffCutGPU::read_restart(FILE *fp) {
   read_restart_settings(fp);
   allocate();
 
-  int i,j;
+  int i, j;
   int me = comm->me;
   for (i = 1; i <= atom->ntypes; i++)
     for (j = i; j <= atom->ntypes; j++) {
-      if (me == 0) utils::sfread(FLERR,&setflag[i][j],sizeof(int),1,fp,NULL,error);
-      MPI_Bcast(&setflag[i][j],1,MPI_INT,0,world);
+      if (me == 0)
+        utils::sfread(FLERR, &setflag[i][j], sizeof(int), 1, fp, NULL, error);
+      MPI_Bcast(&setflag[i][j], 1, MPI_INT, 0, world);
       if (setflag[i][j]) {
-        if (me == 0) utils::sfread(FLERR,&cut[i][j],sizeof(double),1,fp,NULL,error);
-        MPI_Bcast(&cut[i][j],1,MPI_DOUBLE,0,world);
+        if (me == 0)
+          utils::sfread(FLERR, &cut[i][j], sizeof(double), 1, fp, NULL, error);
+        MPI_Bcast(&cut[i][j], 1, MPI_DOUBLE, 0, world);
       }
     }
 }
@@ -980,27 +1025,25 @@ void PairEffCutGPU::read_restart(FILE *fp)
    proc 0 writes to restart file
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::write_restart_settings(FILE *fp)
-{
-  fwrite(&cut_global,sizeof(double),1,fp);
-  fwrite(&offset_flag,sizeof(int),1,fp);
-  fwrite(&mix_flag,sizeof(int),1,fp);
+void PairEffCutGPU::write_restart_settings(FILE *fp) {
+  fwrite(&cut_global, sizeof(double), 1, fp);
+  fwrite(&offset_flag, sizeof(int), 1, fp);
+  fwrite(&mix_flag, sizeof(int), 1, fp);
 }
 
 /* ----------------------------------------------------------------------
    proc 0 reads from restart file, bcasts
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::read_restart_settings(FILE *fp)
-{
+void PairEffCutGPU::read_restart_settings(FILE *fp) {
   if (comm->me == 0) {
-    utils::sfread(FLERR,&cut_global,sizeof(double),1,fp,NULL,error);
-    utils::sfread(FLERR,&offset_flag,sizeof(int),1,fp,NULL,error);
-    utils::sfread(FLERR,&mix_flag,sizeof(int),1,fp,NULL,error);
+    utils::sfread(FLERR, &cut_global, sizeof(double), 1, fp, NULL, error);
+    utils::sfread(FLERR, &offset_flag, sizeof(int), 1, fp, NULL, error);
+    utils::sfread(FLERR, &mix_flag, sizeof(int), 1, fp, NULL, error);
   }
-  MPI_Bcast(&cut_global,1,MPI_DOUBLE,0,world);
-  MPI_Bcast(&offset_flag,1,MPI_INT,0,world);
-  MPI_Bcast(&mix_flag,1,MPI_INT,0,world);
+  MPI_Bcast(&cut_global, 1, MPI_DOUBLE, 0, world);
+  MPI_Bcast(&offset_flag, 1, MPI_INT, 0, world);
+  MPI_Bcast(&mix_flag, 1, MPI_INT, 0, world);
 }
 
 /* ----------------------------------------------------------------------
@@ -1009,8 +1052,8 @@ void PairEffCutGPU::read_restart_settings(FILE *fp)
    these arrays are stored locally by pair style
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::min_xf_pointers(int /*ignore*/, double **xextra, double **fextra)
-{
+void PairEffCutGPU::min_xf_pointers(int /*ignore*/, double **xextra,
+                                    double **fextra) {
   // grow arrays if necessary
   // need to be atom->nmax in length
 
@@ -1018,8 +1061,8 @@ void PairEffCutGPU::min_xf_pointers(int /*ignore*/, double **xextra, double **fe
     memory->destroy(min_eradius);
     memory->destroy(min_erforce);
     nmax = atom->nmax;
-    memory->create(min_eradius,nmax,"pair:min_eradius");
-    memory->create(min_erforce,nmax,"pair:min_erforce");
+    memory->create(min_eradius, nmax, "pair:min_eradius");
+    memory->create(min_erforce, nmax, "pair:min_erforce");
   }
 
   *xextra = min_eradius;
@@ -1031,8 +1074,7 @@ void PairEffCutGPU::min_xf_pointers(int /*ignore*/, double **xextra, double **fe
    calculate and store in min_eradius and min_erforce
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::min_xf_get(int /*ignore*/)
-{
+void PairEffCutGPU::min_xf_get(int /*ignore*/) {
   double *eradius = atom->eradius;
   double *erforce = atom->erforce;
   int *spin = atom->spin;
@@ -1041,8 +1083,9 @@ void PairEffCutGPU::min_xf_get(int /*ignore*/)
   for (int i = 0; i < nlocal; i++)
     if (spin[i]) {
       min_eradius[i] = log(eradius[i]);
-      min_erforce[i] = eradius[i]*erforce[i];
-    } else min_eradius[i] = min_erforce[i] = 0.0;
+      min_erforce[i] = eradius[i] * erforce[i];
+    } else
+      min_eradius[i] = min_erforce[i] = 0.0;
 }
 
 /* ----------------------------------------------------------------------
@@ -1050,24 +1093,23 @@ void PairEffCutGPU::min_xf_get(int /*ignore*/)
    propagate the change back to eradius
 ------------------------------------------------------------------------- */
 
-void PairEffCutGPU::min_x_set(int /*ignore*/)
-{
+void PairEffCutGPU::min_x_set(int /*ignore*/) {
   double *eradius = atom->eradius;
   int *spin = atom->spin;
   int nlocal = atom->nlocal;
 
   for (int i = 0; i < nlocal; i++)
-    if (spin[i]) eradius[i] = exp(min_eradius[i]);
+    if (spin[i])
+      eradius[i] = exp(min_eradius[i]);
 }
 
 /* ----------------------------------------------------------------------
    memory usage of local atom-based arrays
 ------------------------------------------------------------------------- */
 
-double PairEffCutGPU::memory_usage()
-{
+double PairEffCutGPU::memory_usage() {
   double bytes = maxeatom * sizeof(double);
-  bytes += maxvatom*6 * sizeof(double);
+  bytes += maxvatom * 6 * sizeof(double);
   bytes += 2 * nmax * sizeof(double);
   return bytes;
 }

@@ -1,3 +1,7 @@
 *.o
 main
 *.a
+lib/eff_gpu_cpp.o
+lib/eff_gpu_cu.o
+lib/libeff_gpu.a
+lib/main

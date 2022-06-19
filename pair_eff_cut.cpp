@@ -95,6 +95,7 @@ void PairEffCut::compute(int eflag, int vflag)
   int newton_pair = force->newton_pair;
   double qqrd2e = force->qqrd2e;
 
+
   inum = list->inum;
   ilist = list->ilist;
   numneigh = list->numneigh;
