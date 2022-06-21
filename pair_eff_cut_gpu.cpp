@@ -644,17 +644,18 @@ void PairEffCutGPU::compute(int eflag, int vflag) {
       }
     }
   }
-  if (vflag_fdotr) {
-    virial_fdotr_compute();
-    if (pressure_with_evirials_flag)
-      virial_eff_compute();
-  }
-
   cuda_FetchBackData(eff_gpu, natoms, x, f, q, erforce, eradius, spin, type,
                      nlocal, newton_pair, qqrd2e, inum, ilist, numneigh,
                      firstneigh);
   cudaDeviceSynchronize();
   cuda_DeallocateStructure(eff_gpu);
+
+  // CPU Finalization
+  if (vflag_fdotr) {
+    virial_fdotr_compute();
+    if (pressure_with_evirials_flag)
+      virial_eff_compute();
+  }
 }
 
 /* ----------------------------------------------------------------------

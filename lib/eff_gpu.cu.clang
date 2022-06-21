@@ -529,7 +529,7 @@ __device__ void cuda_ev_tally_eff(int eflag_either, // Input
                                   int spinj, int nlocal, int newton_pair,
                                   double energy, double e_virial,
                                   double &eng_coul, // Output
-                                  double *eatom, double6d *vatom,
+                                  double *eatom, double **vatom,
                                   double *virial) {
   double energyhalf;
   double partial_evirial = e_virial / 3.0;
@@ -596,7 +596,7 @@ __device__ void cuda_ev_tally_xyz(int eflag_either, // Input
                                   double dely, double delz,
                                   double &eng_vdwl, // Output
                                   double &eng_coul, double *eatom,
-                                  double *virial, double6d *vatom) {
+                                  double *virial, double **vatom) {
   double evdwlhalf, ecoulhalf, epairhalf, v[6];
 
   if (eflag_either) {
@@ -724,7 +724,7 @@ __global__ void cuda_compute_kernel(struct EFF_GPU &eff_gpu, int eflag,
   double eng_coul = eff_gpu.eng_coul_gpu; // pair statistic data 1
   double eng_vdwl = eff_gpu.eng_vdwl_gpu; // pair statistic data 2
   double *eatom = eff_gpu.eatom_gpu;      // pair statistic data 3
-  double6d *vatom = eff_gpu.vatom_gpu;     // pair statistic data 4
+  double **vatom = eff_gpu.vatom_gpu;     // pair statistic data 4
   double *virial = eff_gpu.virial_gpu;    // pair statistic data 5
 
   double hhmss2e = eff_gpu.hhmss2e_gpu; // eff data 1
