@@ -65,592 +65,83 @@ PairEffCutGPU::~PairEffCutGPU() {
 /* ---------------------------------------------------------------------- */
 
 void PairEffCutGPU::compute(int eflag, int vflag) {
-  int i, j, ii, jj, inum, jnum, itype, jtype;
-  double xtmp, ytmp, ztmp, delx, dely, delz, energy;
-  double eke, ecoul, epauli, errestrain, halfcoul, halfpauli;
-  double fpair, fx, fy, fz;
-  double e1rforce, e2rforce, e1rvirial, e2rvirial;
-  double s_fpair, s_e1rforce, s_e2rforce;
-  double ecp_epauli, ecp_fpair, ecp_e1rforce, ecp_e2rforce;
-  double rsq, rc;
-  int *ilist, *jlist, *numneigh, **firstneigh;
-
-  energy = eke = epauli = ecp_epauli = ecoul = errestrain = 0.0;
-  // pvector = [KE, Pauli, ecoul, radial_restraint]
-  for (i = 0; i < 4; i++)
-    pvector[i] = 0.0;
-
-  ev_init(eflag, vflag);
-
-  int natoms = atom->natoms;
-  double **x = atom->x;
-  double **f = atom->f;
-  double *q = atom->q;
-  double *erforce = atom->erforce;
-  double *eradius = atom->eradius;
-  int *spin = atom->spin;
-  int *type = atom->type;
-  int nlocal = atom->nlocal;
-
-  int newton_pair = force->newton_pair;
-  double qqrd2e = force->qqrd2e;
-
-  inum = list->inum;
-  ilist = list->ilist;
-  numneigh = list->numneigh;
-  firstneigh = list->firstneigh;
-
   struct EFF_GPU eff_gpu;
   eff_gpu = cuda_AllocateStructure();
-  cuda_FetchData(eff_gpu, natoms, x, f, q, erforce, eradius, spin, type, nlocal,
-                 newton_pair, qqrd2e, inum, ilist, numneigh, firstneigh);
-  cudaDeviceSynchronize();
-
-  cuda_eff_test(eff_gpu);
-
-  // cuda_eff_compute(eff_gpu);
-
-  // loop over neighbors of my atoms
-  for (ii = 0; ii < inum; ii++) {
-    i = ilist[ii];
-    xtmp = x[i][0];
-    ytmp = x[i][1];
-    ztmp = x[i][2];
-    itype = type[i];
-    jlist = firstneigh[i];
-    jnum = numneigh[i];
-
-    // add electron wavefuntion kinetic energy (not pairwise)
-
-    if (abs(spin[i]) == 1 || spin[i] == 2) {
-      // reset energy and force temp variables
-      eke = epauli = ecoul = 0.0;
-      fpair = e1rforce = e2rforce = 0.0;
-      s_fpair = 0.0;
-
-      cuda_KinElec(eradius[i], &eke, &e1rforce);
-
-      // Fixed-core
-      if (spin[i] == 2) {
-        // KE(2s)+Coul(1s-1s)+Coul(2s-nuclei)+Pauli(2s)
-        eke *= 2;
-        cuda_ElecNucElec(q[i], 0.0, eradius[i], &ecoul, &fpair, &e1rforce);
-        cuda_ElecNucElec(q[i], 0.0, eradius[i], &ecoul, &fpair, &e1rforce);
-        cuda_ElecElecElec(0.0, eradius[i], eradius[i], &ecoul, &fpair,
-                          &e1rforce, &e2rforce);
-
-        // opposite spin electron interactions
-        cuda_PauliElecElec(0, 0.0, eradius[i], eradius[i], &epauli, &s_fpair,
-                           &e1rforce, &e2rforce);
-
-        // fix core electron size, i.e. don't contribute to ervirial
-        e2rforce = e1rforce = 0.0;
-      }
-
-      // apply unit conversion factors
-      eke *= hhmss2e;
-      ecoul *= qqrd2e;
-      fpair *= qqrd2e;
-      epauli *= hhmss2e;
-      s_fpair *= hhmss2e;
-      e1rforce *= hhmss2e;
-
-      // Sum up contributions
-      energy = eke + epauli + ecoul;
-      fpair = fpair + s_fpair;
-
-      erforce[i] += e1rforce;
-
-      // Tally energy and compute radial atomic virial contribution
-      if (evflag) {
-        ev_tally_eff(i, i, nlocal, newton_pair, energy, 0.0);
-        if (pressure_with_evirials_flag) // iff flexible pressure flag on
-          ev_tally_eff(i, i, nlocal, newton_pair, 0.0, e1rforce * eradius[i]);
-      }
-      if (eflag_global) {
-        pvector[0] += eke;
-        pvector[1] += epauli;
-        pvector[2] += ecoul;
-      }
-    }
-
-    for (jj = 0; jj < jnum; jj++) {
-      j = jlist[jj];
-      j &= NEIGHMASK;
-
-      delx = xtmp - x[j][0];
-      dely = ytmp - x[j][1];
-      delz = ztmp - x[j][2];
-      rsq = delx * delx + dely * dely + delz * delz;
-      rc = sqrt(rsq);
-
-      jtype = type[j];
-
-      if (rsq < cutsq[itype][jtype]) {
-
-        energy = ecoul = epauli = ecp_epauli = 0.0;
-        fx = fy = fz = fpair = s_fpair = ecp_fpair = 0.0;
-
-        double taper = sqrt(cutsq[itype][jtype]);
-        double dist = rc / taper;
-        double spline = cuda_cutoff(dist);
-        double dspline = cuda_dcutoff(dist) / taper;
-
-        // nucleus (i) - nucleus (j) Coul interaction
-
-        if (spin[i] == 0 && spin[j] == 0) {
-          double qxq = q[i] * q[j];
-
-          cuda_ElecNucNuc(qxq, rc, &ecoul, &fpair);
-        }
-
-        // fixed-core (i) - nucleus (j) nuclear Coul interaction
-        else if (spin[i] == 2 && spin[j] == 0) {
-          double qxq = q[i] * q[j];
-          e1rforce = 0.0;
-
-          cuda_ElecNucNuc(qxq, rc, &ecoul, &fpair);
-          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
-          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
-        }
-
-        // nucleus (i) - fixed-core (j) nuclear Coul interaction
-        else if (spin[i] == 0 && spin[j] == 2) {
-          double qxq = q[i] * q[j];
-          e1rforce = 0.0;
-
-          cuda_ElecNucNuc(qxq, rc, &ecoul, &fpair);
-          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
-          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
-        }
-
-        // pseudo-core nucleus (i) - nucleus (j) interaction
-        else if (spin[i] == 3 && spin[j] == 0) {
-          double qxq = q[i] * q[j];
-
-          cuda_ElecCoreNuc(qxq, rc, eradius[i], &ecoul, &fpair);
-        }
-
-        else if (spin[i] == 4 && spin[j] == 0) {
-          double qxq = q[i] * q[j];
-
-          cuda_ElecCoreNuc(qxq, rc, eradius[i], &ecoul, &fpair);
-        }
-
-        // nucleus (i) - pseudo-core nucleus (j) interaction
-        else if (spin[i] == 0 && spin[j] == 3) {
-          double qxq = q[i] * q[j];
-
-          cuda_ElecCoreNuc(qxq, rc, eradius[j], &ecoul, &fpair);
-        }
-
-        else if (spin[i] == 0 && spin[j] == 4) {
-          double qxq = q[i] * q[j];
-
-          cuda_ElecCoreNuc(qxq, rc, eradius[j], &ecoul, &fpair);
-        }
-
-        // nucleus (i) - electron (j) Coul interaction
-
-        else if (spin[i] == 0 && abs(spin[j]) == 1) {
-          e1rforce = 0.0;
-
-          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
-
-          e1rforce = spline * qqrd2e * e1rforce;
-          erforce[j] += e1rforce;
-
-          // Radial electron virial, iff flexible pressure flag set
-          if (evflag && pressure_with_evirials_flag) {
-            e1rvirial = eradius[j] * e1rforce;
-            ev_tally_eff(j, j, nlocal, newton_pair, 0.0, e1rvirial);
-          }
-        }
-
-        // electron (i) - nucleus (j) Coul interaction
-
-        else if (abs(spin[i]) == 1 && spin[j] == 0) {
-          e1rforce = 0.0;
-
-          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
-
-          e1rforce = spline * qqrd2e * e1rforce;
-          erforce[i] += e1rforce;
-
-          // Radial electron virial, iff flexible pressure flag set
-          if (evflag && pressure_with_evirials_flag) {
-            e1rvirial = eradius[i] * e1rforce;
-            ev_tally_eff(i, i, nlocal, newton_pair, 0.0, e1rvirial);
-          }
-        }
-
-        // electron (i) - electron (j) interactions
-
-        else if (abs(spin[i]) == 1 && abs(spin[j]) == 1) {
-          e1rforce = e2rforce = 0.0;
-          s_e1rforce = s_e2rforce = 0.0;
-
-          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-          cuda_PauliElecElec(spin[i] == spin[j], rc, eradius[i], eradius[j],
-                             &epauli, &s_fpair, &s_e1rforce, &s_e2rforce);
-
-          // Apply conversion factor
-          epauli *= hhmss2e;
-          s_fpair *= hhmss2e;
-
-          e1rforce = spline * (qqrd2e * e1rforce + hhmss2e * s_e1rforce);
-          erforce[i] += e1rforce;
-          e2rforce = spline * (qqrd2e * e2rforce + hhmss2e * s_e2rforce);
-          erforce[j] += e2rforce;
-
-          // Radial electron virial, iff flexible pressure flag set
-          if (evflag && pressure_with_evirials_flag) {
-            e1rvirial = eradius[i] * e1rforce;
-            e2rvirial = eradius[j] * e2rforce;
-            ev_tally_eff(i, j, nlocal, newton_pair, 0.0, e1rvirial + e2rvirial);
-          }
-        }
-
-        // fixed-core (i) - electron (j) interactions
-
-        else if (spin[i] == 2 && abs(spin[j]) == 1) {
-          e1rforce = e2rforce = 0.0;
-          s_e1rforce = s_e2rforce = 0.0;
-
-          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e2rforce);
-          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-          cuda_PauliElecElec(0, rc, eradius[i], eradius[j], &epauli, &s_fpair,
-                             &s_e1rforce, &s_e2rforce);
-          cuda_PauliElecElec(1, rc, eradius[i], eradius[j], &epauli, &s_fpair,
-                             &s_e1rforce, &s_e2rforce);
-
-          // Apply conversion factor
-          epauli *= hhmss2e;
-          s_fpair *= hhmss2e;
-
-          // only update virial for j electron
-          e2rforce = spline * (qqrd2e * e2rforce + hhmss2e * s_e2rforce);
-          erforce[j] += e2rforce;
-
-          // Radial electron virial, iff flexible pressure flag set
-          if (evflag && pressure_with_evirials_flag) {
-            e2rvirial = eradius[j] * e2rforce;
-            ev_tally_eff(j, j, nlocal, newton_pair, 0.0, e2rvirial);
-          }
-        }
-
-        // electron (i) - fixed-core (j) interactions
-
-        else if (abs(spin[i]) == 1 && spin[j] == 2) {
-          e1rforce = e2rforce = 0.0;
-          s_e1rforce = s_e2rforce = 0.0;
-
-          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e2rforce);
-          cuda_ElecElecElec(rc, eradius[j], eradius[i], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-          cuda_ElecElecElec(rc, eradius[j], eradius[i], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-
-          cuda_PauliElecElec(0, rc, eradius[j], eradius[i], &epauli, &s_fpair,
-                             &s_e1rforce, &s_e2rforce);
-          cuda_PauliElecElec(1, rc, eradius[j], eradius[i], &epauli, &s_fpair,
-                             &s_e1rforce, &s_e2rforce);
-
-          // Apply conversion factor
-          epauli *= hhmss2e;
-          s_fpair *= hhmss2e;
-
-          // only update virial for i electron
-          e2rforce = spline * (qqrd2e * e2rforce + hhmss2e * s_e2rforce);
-          erforce[i] += e2rforce;
-
-          // add radial atomic virial, iff flexible pressure flag set
-          if (evflag && pressure_with_evirials_flag) {
-            e2rvirial = eradius[i] * e2rforce;
-            ev_tally_eff(i, i, nlocal, newton_pair, 0.0, e2rvirial);
-          }
-        }
-
-        // fixed-core (i) - fixed-core (j) interactions
-
-        else if (spin[i] == 2 && spin[j] == 2) {
-          e1rforce = e2rforce = 0.0;
-          s_e1rforce = s_e2rforce = 0.0;
-          double qxq = q[i] * q[j];
-
-          cuda_ElecNucNuc(qxq, rc, &ecoul, &fpair);
-          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
-          cuda_ElecNucElec(q[i], rc, eradius[j], &ecoul, &fpair, &e1rforce);
-          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
-          cuda_ElecNucElec(q[j], rc, eradius[i], &ecoul, &fpair, &e1rforce);
-          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-          cuda_ElecElecElec(rc, eradius[i], eradius[j], &ecoul, &fpair,
-                            &e1rforce, &e2rforce);
-
-          cuda_PauliElecElec(0, rc, eradius[i], eradius[j], &epauli, &s_fpair,
-                             &s_e1rforce, &s_e2rforce);
-          cuda_PauliElecElec(1, rc, eradius[i], eradius[j], &epauli, &s_fpair,
-                             &s_e1rforce, &s_e2rforce);
-          epauli *= 2;
-          s_fpair *= 2;
-
-          // Apply conversion factor
-          epauli *= hhmss2e;
-          s_fpair *= hhmss2e;
-        }
-
-        // pseudo-core (i) - electron/fixed-core electrons (j) interactions
-
-        else if (spin[i] == 3 && (abs(spin[j]) == 1 || spin[j] == 2)) {
-          e2rforce = ecp_e2rforce = 0.0;
-
-          if (((PAULI_CORE_D[ecp_type[itype]]) == 0.0) &&
-              ((PAULI_CORE_E[ecp_type[itype]]) == 0.0)) {
-            if (abs(spin[j]) == 1) {
-              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
-                                &fpair, &e2rforce);
-              cuda_PauliCoreElec(rc, eradius[j], &ecp_epauli, &ecp_fpair,
-                                 &ecp_e2rforce, PAULI_CORE_A[ecp_type[itype]],
-                                 PAULI_CORE_B[ecp_type[itype]],
-                                 PAULI_CORE_C[ecp_type[itype]]);
-            } else { // add second s electron contribution from fixed-core
-              double qxq = q[i] * q[j];
-              cuda_ElecCoreNuc(qxq, rc, eradius[j], &ecoul, &fpair);
-              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
-                                &fpair, &e2rforce);
-              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
-                                &fpair, &e2rforce);
-              cuda_PauliCoreElec(rc, eradius[j], &ecp_epauli, &ecp_fpair,
-                                 &ecp_e2rforce, PAULI_CORE_A[ecp_type[itype]],
-                                 PAULI_CORE_B[ecp_type[itype]],
-                                 PAULI_CORE_C[ecp_type[itype]]);
-              cuda_PauliCoreElec(rc, eradius[j], &ecp_epauli, &ecp_fpair,
-                                 &ecp_e2rforce, PAULI_CORE_A[ecp_type[itype]],
-                                 PAULI_CORE_B[ecp_type[itype]],
-                                 PAULI_CORE_C[ecp_type[itype]]);
-            }
-          } else {
-            if (abs(spin[j]) == 1) {
-              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
-                                &fpair, &e2rforce);
-              cuda_PauliCorePElec(
-                  rc, eradius[j], &ecp_epauli, &ecp_fpair, &ecp_e2rforce,
-                  PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
-                  PAULI_CORE_C[ecp_type[itype]], PAULI_CORE_D[ecp_type[itype]],
-                  PAULI_CORE_E[ecp_type[itype]]);
-            } else { // add second s electron contribution from fixed-core
-              double qxq = q[i] * q[j];
-              cuda_ElecCoreNuc(qxq, rc, eradius[j], &ecoul, &fpair);
-              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
-                                &fpair, &e2rforce);
-              cuda_ElecCoreElec(q[i], rc, eradius[i], eradius[j], &ecoul,
-                                &fpair, &e2rforce);
-              cuda_PauliCorePElec(
-                  rc, eradius[j], &ecp_epauli, &ecp_fpair, &ecp_e2rforce,
-                  PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
-                  PAULI_CORE_C[ecp_type[itype]], PAULI_CORE_D[ecp_type[itype]],
-                  PAULI_CORE_E[ecp_type[itype]]);
-              cuda_PauliCorePElec(
-                  rc, eradius[j], &ecp_epauli, &ecp_fpair, &ecp_e2rforce,
-                  PAULI_CORE_A[ecp_type[itype]], PAULI_CORE_B[ecp_type[itype]],
-                  PAULI_CORE_C[ecp_type[itype]], PAULI_CORE_D[ecp_type[itype]],
-                  PAULI_CORE_E[ecp_type[itype]]);
-            }
-          }
-
-          // Apply conversion factor from Hartree to kcal/mol
-          ecp_epauli *= h2e;
-          ecp_fpair *= h2e;
-
-          // only update virial for j electron
-          e2rforce = spline * (qqrd2e * e2rforce + h2e * ecp_e2rforce);
-          erforce[j] += e2rforce;
-
-          // add radial atomic virial, iff flexible pressure flag set
-          if (evflag && pressure_with_evirials_flag) {
-            e2rvirial = eradius[j] * e2rforce;
-            ev_tally_eff(j, j, nlocal, newton_pair, 0.0, e2rvirial);
-          }
-        }
-
-        // electron/fixed-core electrons (i) - pseudo-core (j) interactions
-
-        else if ((abs(spin[i]) == 1 || spin[i] == 2) && spin[j] == 3) {
-          e1rforce = ecp_e1rforce = 0.0;
-
-          if (((PAULI_CORE_D[ecp_type[jtype]]) == 0.0) &&
-              ((PAULI_CORE_E[ecp_type[jtype]]) == 0.0)) {
-            if (abs(spin[i]) == 1) {
-              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
-                                &fpair, &e1rforce);
-              cuda_PauliCoreElec(rc, eradius[i], &ecp_epauli, &ecp_fpair,
-                                 &ecp_e1rforce, PAULI_CORE_A[ecp_type[jtype]],
-                                 PAULI_CORE_B[ecp_type[jtype]],
-                                 PAULI_CORE_C[ecp_type[jtype]]);
-            } else {
-              double qxq = q[i] * q[j];
-              cuda_ElecCoreNuc(qxq, rc, eradius[i], &ecoul, &fpair);
-              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
-                                &fpair, &e1rforce);
-              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
-                                &fpair, &e1rforce);
-              cuda_PauliCoreElec(rc, eradius[i], &ecp_epauli, &ecp_fpair,
-                                 &ecp_e1rforce, PAULI_CORE_A[ecp_type[jtype]],
-                                 PAULI_CORE_B[ecp_type[jtype]],
-                                 PAULI_CORE_C[ecp_type[jtype]]);
-              cuda_PauliCoreElec(rc, eradius[i], &ecp_epauli, &ecp_fpair,
-                                 &ecp_e1rforce, PAULI_CORE_A[ecp_type[jtype]],
-                                 PAULI_CORE_B[ecp_type[jtype]],
-                                 PAULI_CORE_C[ecp_type[jtype]]);
-            }
-          } else {
-            if (abs(spin[i]) == 1) {
-              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
-                                &fpair, &e1rforce);
-              cuda_PauliCorePElec(
-                  rc, eradius[i], &ecp_epauli, &ecp_fpair, &ecp_e1rforce,
-                  PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
-                  PAULI_CORE_C[ecp_type[jtype]], PAULI_CORE_D[ecp_type[jtype]],
-                  PAULI_CORE_E[ecp_type[jtype]]);
-            } else {
-              double qxq = q[i] * q[j];
-              cuda_ElecCoreNuc(qxq, rc, eradius[i], &ecoul, &fpair);
-              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
-                                &fpair, &e1rforce);
-              cuda_ElecCoreElec(q[j], rc, eradius[j], eradius[i], &ecoul,
-                                &fpair, &e1rforce);
-              cuda_PauliCorePElec(
-                  rc, eradius[i], &ecp_epauli, &ecp_fpair, &ecp_e1rforce,
-                  PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
-                  PAULI_CORE_C[ecp_type[jtype]], PAULI_CORE_D[ecp_type[jtype]],
-                  PAULI_CORE_E[ecp_type[jtype]]);
-              cuda_PauliCorePElec(
-                  rc, eradius[i], &ecp_epauli, &ecp_fpair, &ecp_e1rforce,
-                  PAULI_CORE_A[ecp_type[jtype]], PAULI_CORE_B[ecp_type[jtype]],
-                  PAULI_CORE_C[ecp_type[jtype]], PAULI_CORE_D[ecp_type[jtype]],
-                  PAULI_CORE_E[ecp_type[jtype]]);
-            }
-          }
-
-          // Apply conversion factor from Hartree to kcal/mol
-          ecp_epauli *= h2e;
-          ecp_fpair *= h2e;
-
-          // only update virial for j electron
-          e1rforce = spline * (qqrd2e * e1rforce + h2e * ecp_e1rforce);
-          erforce[i] += e1rforce;
-
-          // add radial atomic virial, iff flexible pressure flag set
-          if (evflag && pressure_with_evirials_flag) {
-            e1rvirial = eradius[i] * e1rforce;
-            ev_tally_eff(i, i, nlocal, newton_pair, 0.0, e1rvirial);
-          }
-        }
-
-        // pseudo-core (i) - pseudo-core (j) interactions
-
-        else if (spin[i] == 3 && spin[j] == 3) {
-          double qxq = q[i] * q[j];
-
-          cuda_ElecCoreCore(qxq, rc, eradius[i], eradius[j], &ecoul, &fpair);
-        }
-
-        // Apply Coulomb conversion factor for all cases
-        ecoul *= qqrd2e;
-        fpair *= qqrd2e;
-
-        // Sum up energy and force contributions
-        epauli += ecp_epauli;
-        energy = ecoul + epauli;
-        fpair = fpair + s_fpair + ecp_fpair;
-
-        // Apply cutoff spline
-        fpair = fpair * spline - energy * dspline;
-        energy = spline * energy;
-
-        // Tally cartesian forces
-        cuda_SmallRForce(delx, dely, delz, rc, fpair, &fx, &fy, &fz);
-        f[i][0] += fx;
-        f[i][1] += fy;
-        f[i][2] += fz;
-        if (newton_pair || j < nlocal) {
-          f[j][0] -= fx;
-          f[j][1] -= fy;
-          f[j][2] -= fz;
-        }
-
-        // Tally energy (in ecoul) and compute normal pressure virials
-        if (evflag)
-          ev_tally_xyz(i, j, nlocal, newton_pair, 0.0, energy, fx, fy, fz, delx,
-                       dely, delz);
-        if (eflag_global) {
-          if (newton_pair) {
-            pvector[1] += spline * epauli;
-            pvector[2] += spline * ecoul;
-          } else {
-            halfpauli = 0.5 * spline * epauli;
-            halfcoul = 0.5 * spline * ecoul;
-            if (i < nlocal) {
-              pvector[1] += halfpauli;
-              pvector[2] += halfcoul;
-            }
-            if (j < nlocal) {
-              pvector[1] += halfpauli;
-              pvector[2] += halfcoul;
-            }
-          }
-        }
-      }
-    }
-
-    // limit electron stifness (size) for periodic systems, to max=half-box-size
-
-    if (abs(spin[i]) == 1 && limit_eradius_flag) {
-      double half_box_length = 0, dr, kfactor = hhmss2e * 1.0;
-      e1rforce = errestrain = 0.0;
-
-      if (domain->xperiodic == 1 || domain->yperiodic == 1 ||
-          domain->zperiodic == 1) {
-        delx = domain->boxhi[0] - domain->boxlo[0];
-        dely = domain->boxhi[1] - domain->boxlo[1];
-        delz = domain->boxhi[2] - domain->boxlo[2];
-        half_box_length = 0.5 * MIN(delx, MIN(dely, delz));
-        if (eradius[i] > half_box_length) {
-          dr = eradius[i] - half_box_length;
-          errestrain = 0.5 * kfactor * dr * dr;
-          e1rforce = -kfactor * dr;
-          if (eflag_global)
-            pvector[3] += errestrain;
-
-          erforce[i] += e1rforce;
-
-          // Tally radial restrain energy and add radial restrain virial
-          if (evflag) {
-            ev_tally_eff(i, i, nlocal, newton_pair, errestrain, 0.0);
-            if (pressure_with_evirials_flag) // flexible electron pressure
-              ev_tally_eff(i, i, nlocal, newton_pair, 0.0,
-                           eradius[i] * e1rforce);
-          }
-        }
-      }
-    }
-  }
-  cuda_FetchBackData(eff_gpu, natoms, x, f, q, erforce, eradius, spin, type,
-                     nlocal, newton_pair, qqrd2e, inum, ilist, numneigh,
-                     firstneigh);
-  cudaDeviceSynchronize();
+  cuda_FetchData(eff_gpu,                             // structure
+                 atom->natoms,                        // atom data 1
+                 atom->x,                             // atom data 2
+                 atom->f,                             // atom data 3
+                 atom->q,                             // atom data 4
+                 atom->erforce,                       // atom data 5
+                 atom->eradius,                       // atom data 6
+                 atom->spin,                          // atom data 7
+                 atom->type,                          // atom data 8
+                 atom->nlocal,                        // atom data 9
+                 atom->ntypes,                        // atom data 10
+                 force->newton_pair,                  // force data 1
+                 force->qqrd2e,                       // force data 2
+                 hhmss2e,                             // eff data 1
+                 h2e,                                 // eff data 2
+                 pressure_with_evirials_flag,         // eff data 3
+                 cutsq,                               // eff data 4
+                 PAULI_CORE_A,                        // eff data 5
+                 PAULI_CORE_B,                        // eff data 6
+                 PAULI_CORE_C,                        // eff data 7
+                 PAULI_CORE_D,                        // eff data 8
+                 PAULI_CORE_E,                        // eff data 9
+                 ecp_type,                            // eff data 10
+                 limit_eradius_flag,                  // eff data 11
+                 list->inum,                          // list data 1
+                 list->ilist,                         // list data 2
+                 list->numneigh,                      // list data 3 (gen 4)
+                 list->firstneigh,                    // list data 5
+                 evflag,                              // pair data 1
+                 eflag_either,                        // pair data 2
+                 eflag_global,                        // pair data 3
+                 eflag_atom,                          // pair data 4
+                 vflag_either,                        // pair data 5
+                 vflag_global,                        // pair data 6
+                 vflag_atom,                          // pair data 7
+                 pvector,                             // pair data 8
+                 eng_coul,                            // pair statistic data 1
+                 eng_vdwl,                            // pair statistic data 2
+                 eatom,                               // pair statistic data 3
+                 vatom,                               // pair statistic data 4
+                 virial,                              // pair statistic data 5
+                 domain->xperiodic,                   // domain_info data 1
+                 domain->yperiodic,                   // domain_info data 2
+                 domain->zperiodic,                   // domain_info data 3
+                 domain->boxhi[0] - domain->boxlo[0], // domain_info data 4
+                 domain->boxhi[1] - domain->boxlo[1], // domain_info data 5
+                 domain->boxhi[2] - domain->boxlo[2]  // domain_info data 6
+  );
+  cuda_eff_test(eff_gpu, eflag, vflag);
+  cuda_FetchBackData(eff_gpu,            // structure
+                     atom->x,            // atom data 2
+                     atom->f,            // atom data 3
+                     atom->q,            // atom data 4
+                     atom->erforce,      // atom data 5
+                     atom->eradius,      // atom data 6
+                     atom->spin,         // atom data 7
+                     atom->type,         // atom data 8
+                     force->newton_pair, // force data 1
+                     force->qqrd2e,      // force data 2
+                     hhmss2e,            // eff data 1
+                     h2e,                // eff data 2
+                     PAULI_CORE_A,       // eff data 5
+                     PAULI_CORE_B,       // eff data 6
+                     PAULI_CORE_C,       // eff data 7
+                     PAULI_CORE_D,       // eff data 8
+                     PAULI_CORE_E,       // eff data 9
+                     ecp_type,           // eff data 10
+                     pvector,            // pair data 8
+                     eng_coul,           // pair statistic data 1
+                     eng_vdwl,           // pair statistic data 2
+                     eatom,              // pair statistic data 3
+                     vatom,              // pair statistic data 4
+                     virial              // pair statistic data 5
+  );
   cuda_DeallocateStructure(eff_gpu);
-
-  // CPU Finalization
   if (vflag_fdotr) {
     virial_fdotr_compute();
     if (pressure_with_evirials_flag)

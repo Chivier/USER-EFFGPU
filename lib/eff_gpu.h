@@ -135,12 +135,31 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
                     double domain_delz_cpu    // domain_info data 6
 );
 
-void cuda_FetchBackData(EFF_GPU &eff_gpu, int natoms_cpu, double **x_cpu,
-                        double **f_cpu, double *q_cpu, double *erforce_cpu,
-                        double *eradius_cpu, int *spin_cpu, int *type_cpu,
-                        int nlocal_cpu, int newton_pair_cpu, double qqrd2e_cpu,
-                        int inum_cpu, int *ilist_cpu, int *numneigh_cpu,
-                        int **firstneigh_cpu);
+void cuda_FetchBackData(EFF_GPU &eff_gpu,         // structure
+                        double **x_cpu,           // atom data 2
+                        double **f_cpu,           // atom data 3
+                        double *q_cpu,            // atom data 4
+                        double *erforce_cpu,      // atom data 5
+                        double *eradius_cpu,      // atom data 6
+                        int *spin_cpu,            // atom data 7
+                        int *type_cpu,            // atom data 8
+                        int &newton_pair_cpu,     // force data 1
+                        double &qqrd2e_cpu,       // force data 2
+                        double &hhmss2e_cpu,      // eff data 1
+                        double &h2e_cpu,          // eff data 2
+                        double *PAULI_CORE_A_cpu, // eff data 5
+                        double *PAULI_CORE_B_cpu, // eff data 6
+                        double *PAULI_CORE_C_cpu, // eff data 7
+                        double *PAULI_CORE_D_cpu, // eff data 8
+                        double *PAULI_CORE_E_cpu, // eff data 9
+                        int *ecp_type_cpu,        // eff data 10
+                        double *pvector_cpu,      // pair data 8
+                        double &eng_coul_cpu,     // pair statistic data 1
+                        double &eng_vdwl_cpu,     // pair statistic data 2
+                        double *eatom_cpu,        // pair statistic data 3
+                        double **vatom_cpu,       // pair statistic data 4
+                        double *virial_cpu        // pair statistic data 5
+);
 
 // inline cuda kernels
 // double cuda_ipoly02(double x);
@@ -178,7 +197,6 @@ void cuda_FetchBackData(EFF_GPU &eff_gpu, int natoms_cpu, double **x_cpu,
 // double cuda_dcutoff(double x);
 // void cuda_test_add(int *arr, int n);
 
-void cuda_eff_test(struct EFF_GPU &eff_gpu);
-void cuda_eff_compute_kernel();
+void cuda_eff_test(struct EFF_GPU &eff_gpu, int eflag, int vflag);
 
 #endif

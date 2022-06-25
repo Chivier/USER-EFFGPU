@@ -1300,7 +1300,7 @@ __global__ void cuda_compute_kernel(struct EFF_GPU &eff_gpu, int eflag,
 
       if (domain_xperiodic == 1 || domain_yperiodic == 1 ||
           domain_zperiodic == 1) {
-        // delx = domain->boxhi[0]-domain->boxlo[0];
+        // delx = domain->boxhi[0]-dom  ain->boxlo[0];
         // dely = domain->boxhi[1]-domain->boxlo[1];
         // delz = domain->boxhi[2]-domain->boxlo[2];
         delx = domain_delx;
@@ -1335,4 +1335,24 @@ __global__ void cuda_compute_kernel(struct EFF_GPU &eff_gpu, int eflag,
   }
 }
 
-__host__ void cuda_test_add(int *arr, int n) {}
+void cuda_data_test(struct EFF_GPU &eff_gpu) {
+  int index;
+  printf("GPU data\n");
+  printf("x:\n");
+  for (index = 0; index < 10; index++) {
+    printf("%lf ", (eff_gpu.x_gpu[index][0]));
+  }
+  printf("\n");
+  printf("f\n");
+  for (index = 0; index < 10; index++) {
+    printf("%lf ", (eff_gpu.f_gpu[index][0]));
+  }
+  printf("\n");
+  printf("\n");
+}
+
+__host__ void cuda_eff_test(struct EFF_GPU &eff_gpu, int eflag, int vflag) {
+  // cuda_compute_kernel<<<1, 256>>>(eff_gpu, eflag, vflag);
+  cuda_data_test(eff_gpu);
+  cudaDeviceSynchronize();
+}

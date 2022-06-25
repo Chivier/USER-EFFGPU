@@ -1,7 +1,11 @@
 #include "eff_gpu.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <fstream>
+#include <iostream>
 #include <stdio.h>
+
+using namespace std;
 
 struct EFF_GPU cuda_AllocateStructure() {
   struct EFF_GPU eff_gpu;
@@ -190,10 +194,42 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
                     double domain_delz_cpu    // domain_info data 6
 ) {
   int index, subindex;
-  // * atom data
   eff_gpu.natoms_gpu = natoms_cpu;
+  eff_gpu.nlocal_gpu = nlocal_cpu;
+  printf("n = %d\n", natoms_cpu);
+  printf("nlocal = %d\n", nlocal_cpu);
+  printf("ntypes = %d\n", ntypes_cpu);
   int n = natoms_cpu;
 
+  // * Mallocs
+
+  cudaMallocManaged((void **)&(eff_gpu.x_gpu), n * sizeof(double3d));
+  cudaMallocManaged((void **)&(eff_gpu.f_gpu), n * sizeof(double3d));
+  cudaMallocManaged((void **)&(eff_gpu.q_gpu), n * sizeof(int));
+  cudaMallocManaged((void **)&(eff_gpu.erforce_gpu), n * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.eradius_gpu), n * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.spin_gpu), n * sizeof(int));
+  cudaMallocManaged((void **)&(eff_gpu.type_gpu), n * sizeof(int));
+  cudaMallocManaged((void **)&(eff_gpu.ilist_gpu), n * sizeof(int));
+  cudaMallocManaged((void **)&(eff_gpu.numneigh_offset_gpu),
+                    (n + 1) * sizeof(int));
+
+  cudaMallocManaged((void **)&(eff_gpu.numneigh_gpu), n * sizeof(int));
+
+  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_A_gpu), 100 * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_B_gpu), 100 * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_C_gpu), 100 * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_D_gpu), 100 * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_E_gpu), 100 * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.ecp_type_gpu), 100 * sizeof(int));
+  cudaMallocManaged((void **)&(eff_gpu.pvector_gpu), 4 * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.eatom_gpu), nlocal_cpu * sizeof(double));
+  cudaMallocManaged((void **)&(eff_gpu.vatom_gpu),
+                    nlocal_cpu * sizeof(double6d));
+  cudaMallocManaged((void **)&(eff_gpu.virial_gpu), 6 * sizeof(double));
+
+  // * atom data
+  /*
   cudaMallocManaged((void **)&(eff_gpu.x_gpu), n * sizeof(double3d));
   cudaMallocManaged((void **)&(eff_gpu.f_gpu), n * sizeof(double3d));
   cudaMallocManaged((void **)&(eff_gpu.q_gpu), n * sizeof(int));
@@ -215,7 +251,22 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
     eff_gpu.spin_gpu[index] = spin_cpu[index];
     eff_gpu.type_gpu[index] = type_cpu[index];
   }
-  eff_gpu.nlocal_gpu = nlocal_cpu;
+  */
+
+  cuda_HostToDeviceCopy((void *)(eff_gpu.x_gpu), (void *)(x_cpu),
+                        n * sizeof(double3d));
+  cuda_HostToDeviceCopy((void *)(eff_gpu.f_gpu), (void *)(f_cpu),
+                        n * sizeof(double3d));
+  cuda_HostToDeviceCopy((void *)(eff_gpu.erforce_gpu), (void *)(erforce_cpu),
+                        n * sizeof(double));
+  cuda_HostToDeviceCopy((void *)(eff_gpu.eradius_gpu), (void *)(eradius_cpu),
+                        n * sizeof(double));
+  cuda_HostToDeviceCopy((void *)(eff_gpu.q_gpu), (void *)(q_cpu),
+                        n * sizeof(int));
+  cuda_HostToDeviceCopy((void *)(eff_gpu.spin_gpu), (void *)(spin_cpu),
+                        n * sizeof(int));
+  cuda_HostToDeviceCopy((void *)(eff_gpu.type_gpu), (void *)(type_cpu),
+                        n * sizeof(int));
   eff_gpu.ntypes_gpu = ntypes_cpu;
 
   // * force data
@@ -225,11 +276,9 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
   // * list data
   eff_gpu.inum_gpu = inum_cpu;
 
-  cudaMallocManaged((void **)&(eff_gpu.ilist_gpu), n * sizeof(int));
   cudaMemcpy((void *)(eff_gpu.ilist_gpu), (void *)ilist_cpu, n * sizeof(int),
              cudaMemcpyHostToDevice);
 
-  cudaMallocManaged((void **)&(eff_gpu.numneigh_gpu), n * sizeof(int));
   cuda_HostToDeviceCopy((void *)(eff_gpu.numneigh_gpu), (void *)numneigh_cpu,
                         n * sizeof(int));
 
@@ -238,8 +287,6 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
   int *numneigh_offset_cpu;
   int *firstneigh_temparary;
   numneigh_offset_cpu = (int *)malloc((n + 1) * sizeof(int));
-  cudaMallocManaged((void **)&(eff_gpu.numneigh_offset_gpu),
-                    (n + 1) * sizeof(int));
   for (index = 0; index < n; ++index) {
     numneigh_offset_cpu[index] = total_length;
     total_length += numneigh_cpu[index];
@@ -270,28 +317,34 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
   eff_gpu.pressure_with_evirials_flag_gpu = pressure_with_evirials_flag_cpu;
   cudaMallocManaged((void **)&(eff_gpu.cutsq_gpu),
                     (ntypes_cpu + 1) * (ntypes_cpu + 1) * sizeof(double));
+  double *cutsq_gpu_temp;
+  cutsq_gpu_temp =
+      (double *)malloc(sizeof(double) * (ntypes_cpu + 1) * (ntypes_cpu + 1));
   for (index = 0; index <= ntypes_cpu; ++index) {
     for (subindex = 0; subindex <= ntypes_cpu; ++subindex) {
-      eff_gpu.cutsq_gpu[index * (ntypes_cpu + 1) + subindex] =
+      cutsq_gpu_temp[index * (ntypes_cpu + 1) + subindex] =
           cutsq_cpu[index][subindex];
     }
   }
-  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_A_gpu), 100 * sizeof(double));
+  cuda_HostToDeviceCopy((void *)(eff_gpu.cutsq_gpu), (void *)(cutsq_gpu_temp),
+                        sizeof(double) * (ntypes_cpu + 1) * (ntypes_cpu + 1));
+  free(cutsq_gpu_temp);
+
   cuda_HostToDeviceCopy((void *)(eff_gpu.PAULI_CORE_A_gpu),
                         (void *)PAULI_CORE_A_cpu, 100 * sizeof(double));
-  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_B_gpu), 100 * sizeof(double));
+
   cuda_HostToDeviceCopy((void *)(eff_gpu.PAULI_CORE_B_gpu),
                         (void *)PAULI_CORE_B_cpu, 100 * sizeof(double));
-  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_C_gpu), 100 * sizeof(double));
+
   cuda_HostToDeviceCopy((void *)(eff_gpu.PAULI_CORE_C_gpu),
                         (void *)PAULI_CORE_C_cpu, 100 * sizeof(double));
-  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_D_gpu), 100 * sizeof(double));
+
   cuda_HostToDeviceCopy((void *)(eff_gpu.PAULI_CORE_D_gpu),
                         (void *)PAULI_CORE_D_cpu, 100 * sizeof(double));
-  cudaMallocManaged((void **)&(eff_gpu.PAULI_CORE_E_gpu), 100 * sizeof(double));
+
   cuda_HostToDeviceCopy((void *)(eff_gpu.PAULI_CORE_E_gpu),
                         (void *)PAULI_CORE_E_cpu, 100 * sizeof(double));
-  cudaMallocManaged((void **)&(eff_gpu.ecp_type_gpu), 100 * sizeof(int));
+
   cuda_HostToDeviceCopy((void *)(eff_gpu.ecp_type_gpu), (void *)(ecp_type_cpu),
                         100 * sizeof(int));
   eff_gpu.limit_eradius_flag_gpu = limit_eradius_flag_cpu;
@@ -304,7 +357,7 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
   eff_gpu.vflag_either_gpu = vflag_either_cpu;
   eff_gpu.vflag_global_gpu = vflag_global_cpu;
   eff_gpu.vflag_atom_gpu = vflag_atom_cpu;
-  cudaMallocManaged((void **)&(eff_gpu.pvector_gpu), 4 * sizeof(double));
+
   eff_gpu.pvector_gpu[0] = 0;
   eff_gpu.pvector_gpu[1] = 0;
   eff_gpu.pvector_gpu[2] = 0;
@@ -313,19 +366,12 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
   // * pair statistic data
   eff_gpu.eng_coul_gpu = eng_coul_cpu;
   eff_gpu.eng_vdwl_gpu = eng_vdwl_cpu;
-  cudaMallocManaged((void **)&(eff_gpu.eatom_gpu), n * sizeof(double));
-  cuda_HostToDeviceCopy((void *)(eff_gpu.eatom_gpu), eatom_cpu,
-                        n * sizeof(double));
-  cudaMallocManaged((void **)&(eff_gpu.vatom_gpu), n * sizeof(double6d));
-  for (index = 0; index < n; ++index) {
-    eff_gpu.vatom_gpu[index][0] = vatom_cpu[index][0];
-    eff_gpu.vatom_gpu[index][1] = vatom_cpu[index][1];
-    eff_gpu.vatom_gpu[index][2] = vatom_cpu[index][2];
-    eff_gpu.vatom_gpu[index][3] = vatom_cpu[index][3];
-    eff_gpu.vatom_gpu[index][4] = vatom_cpu[index][4];
-    eff_gpu.vatom_gpu[index][5] = vatom_cpu[index][5];
-  }
-  cudaMallocManaged((void **)&(eff_gpu.virial_gpu), 6 * sizeof(double));
+
+  cuda_HostToDeviceCopy((void *)(eff_gpu.eatom_gpu), (void *)(eatom_cpu),
+                        nlocal_cpu * sizeof(double));
+
+  cuda_HostToDeviceCopy((void *)(eff_gpu.vatom_gpu), (void *)(vatom_cpu),
+                        nlocal_cpu * sizeof(double6d));
 
   // * domain_info data
   eff_gpu.domain_xperiodic_gpu = domain_xperiodic_cpu;
@@ -334,36 +380,113 @@ void cuda_FetchData(EFF_GPU &eff_gpu,                    // structure
   eff_gpu.domain_delx_gpu = domain_delx_cpu;
   eff_gpu.domain_dely_gpu = domain_dely_cpu;
   eff_gpu.domain_delz_gpu = domain_delz_cpu;
+
+  // Unified Memory Check
+  // ofstream output_file;
+  // output_file.open("gpu_data_check.txt");
+  // output_file << " x = \n";
+  // for (index = 0; index < 10; ++index)
+  //   output_file << eff_gpu.x[index][0] << " ";
+  // output_file.close();
 }
 
-void cuda_FetchBackData(EFF_GPU &eff_gpu, int natoms_cpu, double **x_cpu,
-                        double **f_cpu, double *q_cpu, double *erforce_cpu,
-                        double *eradius_cpu, int *spin_cpu, int *type_cpu,
-                        int nlocal_cpu, int newton_pair_cpu, double qqrd2e_cpu,
-                        int inum_cpu, int *ilist_cpu, int *numneigh_cpu,
-                        int **firstneigh_cpu) {
+void cuda_FetchBackData(EFF_GPU &eff_gpu,         // structure
+                        double **x_cpu,           // atom data 2
+                        double **f_cpu,           // atom data 3
+                        double *q_cpu,            // atom data 4
+                        double *erforce_cpu,      // atom data 5
+                        double *eradius_cpu,      // atom data 6
+                        int *spin_cpu,            // atom data 7
+                        int *type_cpu,            // atom data 8
+                        int &newton_pair_cpu,     // force data 1
+                        double &qqrd2e_cpu,       // force data 2
+                        double &hhmss2e_cpu,      // eff data 1
+                        double &h2e_cpu,          // eff data 2
+                        double *PAULI_CORE_A_cpu, // eff data 5
+                        double *PAULI_CORE_B_cpu, // eff data 6
+                        double *PAULI_CORE_C_cpu, // eff data 7
+                        double *PAULI_CORE_D_cpu, // eff data 8
+                        double *PAULI_CORE_E_cpu, // eff data 9
+                        int *ecp_type_cpu,        // eff data 10
+                        double *pvector_cpu,      // pair data 8
+                        double &eng_coul_cpu,     // pair statistic data 1
+                        double &eng_vdwl_cpu,     // pair statistic data 2
+                        double *eatom_cpu,        // pair statistic data 3
+                        double **vatom_cpu,       // pair statistic data 4
+                        double *virial_cpu        // pair statistic data 5
+) {
+  cudaDeviceSynchronize();
+  // * atom data
   // natoms : copy
-  int n = natoms_cpu;
+  int n = eff_gpu.natoms_gpu;
 
-  cudaDeviceSynchronize();
+  // for (int index = 0; index < n; ++index) {
+  //   x_cpu[index][0] = eff_gpu.x_gpu[index][0];
+  //   x_cpu[index][1] = eff_gpu.x_gpu[index][1];
+  //   x_cpu[index][2] = eff_gpu.x_gpu[index][2];
+  //   f_cpu[index][0] = eff_gpu.f_gpu[index][0];
+  //   f_cpu[index][1] = eff_gpu.f_gpu[index][1];
+  //   f_cpu[index][2] = eff_gpu.f_gpu[index][2];
+  //   q_cpu[index] = eff_gpu.q_gpu[index];
+  //   erforce_cpu[index] = eff_gpu.erforce_gpu[index];
+  //   eradius_cpu[index] = eff_gpu.eradius_gpu[index];
+  //   spin_cpu[index] = eff_gpu.spin_gpu[index];
+  //   type_cpu[index] = eff_gpu.type_gpu[index];
+  // }
 
-  // x : copy
-  for (int index = 0; index < n; ++index) {
-    x_cpu[index][0] = eff_gpu.x_gpu[index][0];
-    x_cpu[index][1] = eff_gpu.x_gpu[index][1];
-    x_cpu[index][2] = eff_gpu.x_gpu[index][2];
-    f_cpu[index][0] = eff_gpu.f_gpu[index][0];
-    f_cpu[index][1] = eff_gpu.f_gpu[index][1];
-    f_cpu[index][2] = eff_gpu.f_gpu[index][2];
-    q_cpu[index] = eff_gpu.q_gpu[index];
-    erforce_cpu[index] = eff_gpu.erforce_gpu[index];
-    eradius_cpu[index] = eff_gpu.eradius_gpu[index];
-    spin_cpu[index] = eff_gpu.spin_gpu[index];
-    type_cpu[index] = eff_gpu.type_gpu[index];
-  }
-  cuda_DeviceToHostCopy((void *)ilist_cpu, (void *)(eff_gpu.ilist_gpu),
+  cuda_DeviceToHostCopy((void *)(x_cpu), (void *)(eff_gpu.x_gpu),
+                        n * sizeof(double3d));
+  cuda_DeviceToHostCopy((void *)(f_cpu), (void *)(eff_gpu.f_gpu),
+                        n * sizeof(double3d));
+  cuda_DeviceToHostCopy((void *)(erforce_cpu), (void *)(eff_gpu.erforce_gpu),
+                        n * sizeof(double));
+  cuda_DeviceToHostCopy((void *)(eradius_cpu), (void *)(eff_gpu.eradius_gpu),
+                        n * sizeof(double));
+  cuda_DeviceToHostCopy((void *)(q_cpu), (void *)(eff_gpu.q_gpu),
                         n * sizeof(int));
-  cudaDeviceSynchronize();
-}
+  cuda_DeviceToHostCopy((void *)(spin_cpu), (void *)(eff_gpu.spin_gpu),
+                        n * sizeof(int));
+  cuda_DeviceToHostCopy((void *)(type_cpu), (void *)(eff_gpu.type_gpu),
+                        n * sizeof(int));
 
-void cuda_eff_test(struct EFF_GPU &eff_gpu) {}
+  // * force data
+  newton_pair_cpu = eff_gpu.newton_pair_gpu;
+  qqrd2e_cpu = eff_gpu.qqrd2e_gpu;
+
+  // * eff data
+  hhmss2e_cpu = eff_gpu.hhmss2e_gpu;
+  h2e_cpu = eff_gpu.h2e_gpu;
+  cuda_DeviceToHostCopy((void *)PAULI_CORE_A_cpu,
+                        (void *)eff_gpu.PAULI_CORE_A_gpu, sizeof(double) * 100);
+  cuda_DeviceToHostCopy((void *)PAULI_CORE_B_cpu,
+                        (void *)eff_gpu.PAULI_CORE_B_gpu, sizeof(double) * 100);
+  cuda_DeviceToHostCopy((void *)PAULI_CORE_C_cpu,
+                        (void *)eff_gpu.PAULI_CORE_C_gpu, sizeof(double) * 100);
+  cuda_DeviceToHostCopy((void *)PAULI_CORE_D_cpu,
+                        (void *)eff_gpu.PAULI_CORE_D_gpu, sizeof(double) * 100);
+  cuda_DeviceToHostCopy((void *)PAULI_CORE_E_cpu,
+                        (void *)eff_gpu.PAULI_CORE_E_gpu, sizeof(double) * 100);
+  cuda_DeviceToHostCopy((void *)ecp_type_cpu, (void *)eff_gpu.ecp_type_gpu,
+                        sizeof(int) * 100);
+
+  // * pair data
+  pvector_cpu[0] = eff_gpu.pvector_gpu[0];
+  pvector_cpu[1] = eff_gpu.pvector_gpu[1];
+  pvector_cpu[2] = eff_gpu.pvector_gpu[2];
+  pvector_cpu[3] = eff_gpu.pvector_gpu[3];
+
+  eng_coul_cpu = eff_gpu.eng_coul_gpu;
+  eng_vdwl_cpu = eff_gpu.eng_vdwl_gpu;
+
+  cuda_DeviceToHostCopy((void *)(vatom_cpu), (void *)(eff_gpu.vatom_gpu),
+                        n * sizeof(double6d));
+
+  cuda_DeviceToHostCopy((void *)(eatom_cpu), (void *)(eff_gpu.eatom_gpu),
+                        n * sizeof(double));
+  virial_cpu[0] = eff_gpu.virial_gpu[0];
+  virial_cpu[1] = eff_gpu.virial_gpu[1];
+  virial_cpu[2] = eff_gpu.virial_gpu[2];
+  virial_cpu[3] = eff_gpu.virial_gpu[3];
+  virial_cpu[4] = eff_gpu.virial_gpu[4];
+  virial_cpu[5] = eff_gpu.virial_gpu[5];
+}
